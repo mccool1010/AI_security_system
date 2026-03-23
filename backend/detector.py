@@ -161,6 +161,7 @@ def detect(frame, imgsz=640, conf=0.6):
             "box": [x1, y1, x2, y2],
             "pose_action": pose_action,
             "height_px": round(height_px, 1),
+            "keypoints": kpts_list if kpts_list else None,
         }
         detections.append(det)
 

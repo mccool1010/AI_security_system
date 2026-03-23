@@ -14,10 +14,7 @@ echo.
 echo  [1/2] Starting backend server...
 cd /d "%~dp0backend"
 
-:: Activate venv if it exists
-if exist "venv\Scripts\activate.bat" (
-    call venv\Scripts\activate.bat
-)
+
 
 start "SecureVision Backend" cmd /k "title SecureVision Backend && color 0E && python app.py"
 

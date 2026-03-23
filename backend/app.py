@@ -7,6 +7,7 @@ import signal
 import threading
 import os
 import detector
+import height_estimator
 from action_recognizer import ActionRecognizer
 from datetime import datetime
 from pymongo import MongoClient
@@ -109,33 +110,41 @@ os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 
 # ── Frame overlay helper ─────────────────────────────
-def _estimate_height(det, ref_scale):
-    """Estimate height in metres from bounding box + reference scale."""
-    height_px = det.get("height_px", 0) or abs(det["box"][3] - det["box"][1])
-    mpp = ref_scale.get("meters_per_pixel")
-    if mpp and height_px > 10:
-        return round(float(height_px * mpp), 2)
-    return None
+def _estimate_height_new(det, frame_shape):
+    """Estimate height using keypoint-based height estimator."""
+    kpts = det.get("keypoints")
+    box = det.get("box", [])
+    if len(box) < 4:
+        return None
+    kpts_np = np.array(kpts) if kpts else None
+    result = height_estimator.estimate_height(
+        kpts_np, box, frame_shape, pose_action=det.get("pose_action")
+    )
+    return result
 
 
-def _auto_calibrate(det, ref_scale):
-    """Auto-set meters_per_pixel on first standing person detection."""
-    if ref_scale.get("meters_per_pixel") is not None:
+def _auto_calibrate_new(det, frame_shape):
+    """Auto-calibrate height estimator on first standing person."""
+    if height_estimator.is_calibrated():
         return
     if det.get("pose_action") == "standing":
-        h_px = det.get("height_px", 0) or abs(det["box"][3] - det["box"][1])
-        if h_px > 80:  # reasonable minimum
-            ref_scale["meters_per_pixel"] = AVG_PERSON_HEIGHT_M / h_px
-            ref_scale["reference_height_m"] = AVG_PERSON_HEIGHT_M
-            ref_scale["reference_pixels"] = h_px
-            print(f"  ✅ Height auto-calibrated: {ref_scale['meters_per_pixel']:.5f} m/px"
-                  f" (ref: {h_px:.0f} px ≈ {AVG_PERSON_HEIGHT_M}m)", flush=True)
+        kpts = det.get("keypoints")
+        box = det.get("box", [])
+        if len(box) < 4:
+            return
+        kpts_np = np.array(kpts) if kpts else None
+        height_estimator.auto_calibrate(
+            kpts_np, box, frame_shape,
+            known_height_m=AVG_PERSON_HEIGHT_M
+        )
 
 
 def draw_overlays(frame, detections, ref_scale, faces=None, risk_level=None, slowfast_actions=None):
     """
     Draw rich overlays on the video frame for each detected person:
-    - Height estimate (~1.72m)
+    - Height estimate with confidence (~1.72m ±0.05)
+    - Distance estimate (Dist: ~2.3m)
+    - Visibility class (upper body, full body, etc.)
     - ML pose action (Standing)
     - SlowFast activity (Climbing 87%)
     - Face name when recognized
@@ -152,6 +161,8 @@ def draw_overlays(frame, detections, ref_scale, faces=None, risk_level=None, slo
     if faces:
         for fi, f in enumerate(faces):
             face_map[fi] = f  # simple: map face index to detection index
+
+    frame_shape = frame.shape
 
     for i, det in enumerate(detections):
         if det.get("class") != "person":
@@ -177,11 +188,29 @@ def draw_overlays(frame, detections, ref_scale, faces=None, risk_level=None, slo
         if pose and pose != "unknown":
             labels.append(f"Pose: {pose.capitalize()}")
 
-        # Height estimation
-        h_m = _estimate_height(det, ref_scale)
-        if h_m:
-            labels.append(f"Height: ~{h_m}m")
+        # ── Keypoint-based height estimation ──
+        h_result = _estimate_height_new(det, frame_shape)
+        if h_result and h_result.get("height_m") and h_result.get("confidence", 0) > 0.25:
+            h_m = h_result["height_m"]
+            margin = h_result.get("margin_m", 0.10)
+            conf = h_result.get("confidence", 0)
+            # Show height with margin
+            if conf >= 0.6:
+                labels.append(f"Height: {h_m}m \u00b1{margin}m")
+            else:
+                labels.append(f"Height: ~{h_m}m (est)")
             det["_height_m"] = h_m  # stash for event saving
+
+            # Distance estimate
+            dist = h_result.get("distance_m")
+            if dist:
+                labels.append(f"Dist: ~{dist}m")
+
+            # Visibility class (only show if partial)
+            vis = h_result.get("visibility", "")
+            if vis and vis not in ("full_body", "unknown"):
+                vis_label = vis.replace("_", " ").title()
+                labels.append(f"Visible: {vis_label}")
 
         # Face name
         face = face_map.get(i)
@@ -369,13 +398,14 @@ def _ml_worker():
                 "box": [float(v) for v in d.get("box", [])],
                 "pose_action": d.get("pose_action", "unknown"),
                 "height_px": d.get("height_px", 0),
+                "keypoints": d.get("keypoints"),
             }
             for d in detections
             if float(d.get("confidence", 0.0)) >= CONF_THRESHOLD and d.get("class") == "person"
         ]
 
         for d in detections:
-            _auto_calibrate(d, reference_scale)
+            _auto_calibrate_new(d, frame.shape)
 
         # Push to SlowFast buffer
         activity_recognizer.push_frame(frame)
@@ -447,9 +477,13 @@ def _ml_worker():
 
             try:
                 if len(detections) > 0:
-                    h = _estimate_height(detections[0], reference_scale)
-                    if h:
-                        event_doc["height_m"] = h
+                    h_res = _estimate_height_new(detections[0], frame.shape)
+                    if h_res and h_res.get("height_m"):
+                        event_doc["height_m"] = h_res["height_m"]
+                        event_doc["height_confidence"] = h_res.get("confidence", 0)
+                        event_doc["height_visibility"] = h_res.get("visibility", "unknown")
+                        if h_res.get("distance_m"):
+                            event_doc["distance_m"] = h_res["distance_m"]
             except Exception as e:
                 print("Height estimation error:", e, flush=True)
 
@@ -541,17 +575,24 @@ _ml_thread = threading.Thread(target=_ml_worker, daemon=True)
 _ml_thread.start()
 
 
-def generate_frames():
+# ── Shared display frame for MJPEG streaming ──────────────────────
+# Only ONE thread (the camera reader) reads from the camera and composes
+# the display frame.  All MJPEG Response generators just copy this buffer,
+# preventing the "split/mirror" glitch caused by multiple concurrent readers.
+_display_frame = None
+_display_frame_lock = threading.Lock()
+
+
+def _camera_reader():
     """
-    Fast streaming loop — reads camera at native FPS (~30),
-    draws cached ML overlays, encodes JPEG, and yields MJPEG chunks.
-    NO heavy ML work here; that's all in _ml_worker().
+    Single background thread that reads the camera at native FPS,
+    draws cached ML overlays, and stores the composed frame in
+    _display_frame.  MJPEG generators read from there.
     """
-    global camera, _latest_frame
+    global camera, _latest_frame, _display_frame
     global camera_paused
 
-    frame_count = 0
-    print("⚙️  generate_frames() started (fast streaming mode)", flush=True)
+    print("⚙️  Camera reader thread started", flush=True)
 
     while True:
         if camera_paused:
@@ -576,22 +617,44 @@ def generate_frames():
         with _latest_frame_lock:
             _latest_frame = frame
 
-        frame_count += 1
-
         # Draw cached ML overlays (very cheap — just rectangles + text)
         overlay = _cached_overlay_data
         display = draw_overlays(
-            frame, overlay["detections"], reference_scale,
+            frame.copy(), overlay["detections"], reference_scale,
             risk_level=overlay["risk_level"],
             slowfast_actions=overlay["sf_actions"],
         )
 
-        # Encode and yield
+        # Encode once and store
         _, buffer = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        with _display_frame_lock:
+            _display_frame = buffer.tobytes()
+
+
+# Start the single camera reader thread
+_cam_reader_thread = threading.Thread(target=_camera_reader, daemon=True)
+_cam_reader_thread.start()
+
+
+def generate_frames():
+    """
+    MJPEG generator — yields the latest composed display frame.
+    Multiple connections can call this safely; they all read from
+    the same shared buffer (no camera contention).
+    """
+    while True:
+        with _display_frame_lock:
+            frame_bytes = _display_frame
+
+        if frame_bytes is None:
+            time.sleep(0.03)
+            continue
+
         yield (
             b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
         )
+        time.sleep(0.033)  # ~30 FPS cap per client
 
 @app.route("/video_feed")
 def video_feed():
@@ -1119,6 +1182,7 @@ def _generate_cam_feed(cam_entry):
                 "box": [float(v) for v in d.get("box", [])],
                 "pose_action": d.get("pose_action", "unknown"),
                 "height_px": d.get("height_px", 0),
+                "keypoints": d.get("keypoints"),
             }
             for d in detections
             if float(d.get("confidence", 0.0)) >= CONF_THRESHOLD and d.get("class") == "person"
@@ -1126,7 +1190,7 @@ def _generate_cam_feed(cam_entry):
 
         # Auto-calibrate height on first standing person
         for d in detections:
-            _auto_calibrate(d, reference_scale)
+            _auto_calibrate_new(d, frame.shape)
 
         # Push frame to SlowFast buffer for activity recognition
         activity_recognizer.push_frame(frame)
@@ -1194,9 +1258,13 @@ def _generate_cam_feed(cam_entry):
             # Estimate height
             try:
                 if len(detections) > 0:
-                    h = _estimate_height(detections[0], reference_scale)
-                    if h:
-                        event_doc["height_m"] = h
+                    h_res = _estimate_height_new(detections[0], frame.shape)
+                    if h_res and h_res.get("height_m"):
+                        event_doc["height_m"] = h_res["height_m"]
+                        event_doc["height_confidence"] = h_res.get("confidence", 0)
+                        event_doc["height_visibility"] = h_res.get("visibility", "unknown")
+                        if h_res.get("distance_m"):
+                            event_doc["distance_m"] = h_res["distance_m"]
             except Exception as e:
                 print(f"Height estimation error: {e}", flush=True)
 

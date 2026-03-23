@@ -89,16 +89,19 @@ export default function DashboardPage() {
     return () => clearInterval(id);
   }, []);
 
+  const selectedCamRef = useRef(selectedCam);
+  selectedCamRef.current = selectedCam;
+
   const fetchCameras = useCallback(async () => {
     try {
       const res = await fetch("/api/cameras");
       const data = await res.json();
       setCameras(data);
-      if (!selectedCam && data.length > 0) setSelectedCam(data[0].id);
+      if (!selectedCamRef.current && data.length > 0) setSelectedCam(data[0].id);
     } catch (err) {
       console.error("Failed to fetch cameras", err);
     }
-  }, [selectedCam]);
+  }, []);
 
   useEffect(() => {
     fetchCameras();
