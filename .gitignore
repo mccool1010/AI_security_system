@@ -1,0 +1,46 @@
+# ── Python ──────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+
+# Virtual environment
+backend/venv/
+venv/
+.env
+
+# ── Node.js ─────────────────────────────────
+node_modules/
+dashboard/node_modules/
+
+# ── Build output ────────────────────────────
+dashboard/dist/
+
+# ── ML Models (large files, auto-downloaded) ─
+backend/*.pt
+backend/*.onnx
+backend/kinetics_400_labels.json
+backend/yolov8n-pose.pt
+
+# ── Screenshots & media ────────────────────
+backend/screenshots/
+
+# ── IDE / OS ────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+.DS_Store
+
+# ── Logs ────────────────────────────────────
+*.log
+npm-debug.log*
+
+# ── Misc ────────────────────────────────────
+.gemini/
