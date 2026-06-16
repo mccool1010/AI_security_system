@@ -22,6 +22,22 @@ export default defineConfig({
         target: 'http://localhost:5000',
         changeOrigin: true,
       },
+      '/api/detections': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      },
+      '/api/system': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      },
+      '/api/calibrate': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      },
+      '/activity_status': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      },
       '/camera': {
         target: 'http://localhost:5000',
         changeOrigin: true,
@@ -51,6 +67,14 @@ export default defineConfig({
         changeOrigin: true,
       },
       '/video_feed': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      },
+      '/health': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      },
+      '/set_reference': {
         target: 'http://localhost:5000',
         changeOrigin: true,
       },

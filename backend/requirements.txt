@@ -45,3 +45,4 @@ urllib3==2.5.0
 Werkzeug==3.1.3
 pytorchvideo>=0.1.5
 deepface>=0.0.89
+timm>=0.9.0

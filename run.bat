@@ -7,14 +7,25 @@ echo  ============================================================
 echo    SecureVision AI Surveillance Platform
 echo  ============================================================
 echo.
-echo    Starting backend + dashboard...
+echo    Starting database + backend + dashboard...
 echo.
 
+:: ── Start MongoDB (Docker) ──────────────────────────────────
+echo  [1/3] Starting MongoDB in Docker...
+cd /d "%~dp0"
+docker info >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo         Docker is not running! Please open Docker Desktop.
+    echo         Trying to continue without Docker MongoDB...
+    echo         (Make sure MongoDB is running some other way)
+) else (
+    docker compose up -d mongodb >nul 2>&1
+    echo         MongoDB started
+)
+
 :: ── Start Backend (Python Flask) ────────────────────────────
-echo  [1/2] Starting backend server...
+echo  [2/3] Starting backend server...
 cd /d "%~dp0backend"
-
-
 
 start "SecureVision Backend" cmd /k "title SecureVision Backend && color 0E && python app.py"
 
@@ -23,7 +34,7 @@ echo         Waiting for backend to initialize...
 timeout /t 4 /nobreak >nul
 
 :: ── Start Dashboard (Vite dev server) ───────────────────────
-echo  [2/2] Starting dashboard...
+echo  [3/3] Starting dashboard...
 cd /d "%~dp0dashboard"
 start "SecureVision Dashboard" cmd /k "title SecureVision Dashboard && color 0B && npm run dev"
 
@@ -40,6 +51,7 @@ echo  ============================================================
 echo    System is running!
 echo  ============================================================
 echo.
+echo    MongoDB:    localhost:27017  (Docker)
 echo    Backend:    http://localhost:5000
 echo    Dashboard:  http://localhost:5173
 echo.
@@ -52,3 +64,4 @@ echo    Press any key to close this launcher...
 echo  ============================================================
 echo.
 pause
+

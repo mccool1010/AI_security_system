@@ -9,6 +9,9 @@ import os
 import detector
 import height_estimator
 from action_recognizer import ActionRecognizer
+from camera_calibrator import CameraCalibrator, list_presets as list_camera_presets
+from depth_estimator import DepthEstimator
+import image_quality
 from datetime import datetime
 from pymongo import MongoClient
 from flask import request
@@ -24,7 +27,7 @@ CORS(app)
 # ---------- MongoDB setup ----------
 # Use a local MongoDB server. If you run `mongod` locally the default host/port is fine.
 # If you're using a custom host/port, replace the URI below.
-MONGO_URI = "mongodb://localhost:27017/"
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
 client = MongoClient(MONGO_URI)
 db = client["security_system"]
 events_collection = db["events"]
@@ -49,6 +52,23 @@ AVG_PERSON_HEIGHT_M = 1.7  # default assumption for auto-calibration
 # ── SlowFast action recognizer (Kinetics-400) ────
 activity_recognizer = ActionRecognizer()
 
+# ── Camera calibrator & depth estimator ────
+# Per-camera calibrators stored in dict; default local camera uses "cam_local"
+camera_calibrators: dict[str, CameraCalibrator] = {}
+
+def get_calibrator(cam_id: str = "cam_local") -> CameraCalibrator:
+    """Get or create a CameraCalibrator for a given camera ID."""
+    if cam_id not in camera_calibrators:
+        camera_calibrators[cam_id] = CameraCalibrator(cam_id)
+    return camera_calibrators[cam_id]
+
+# Initialize default calibrator
+_default_calibrator = get_calibrator("cam_local")
+
+# Depth estimator (shared across all cameras — single MiDaS model)
+# Uses MiDaS_small by default for faster inference; change to "DPT_Large" for best accuracy
+depth_est = DepthEstimator(model_type="MiDaS_small")
+
 def load_users_cache():
     global cached_users
     cached_users = []
@@ -70,7 +90,14 @@ def load_users_cache():
 load_users_cache()
 
 # ---------- Camera & detection setup ----------
+from demo_video import DEMO_MODE, get_demo_camera
+
+if DEMO_MODE:
+    print("🎬 DEMO MODE — Using sample video instead of live camera", flush=True)
+
 def get_camera():
+    if DEMO_MODE:
+        return get_demo_camera()
     cam = cv2.VideoCapture(0)
     cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -110,15 +137,24 @@ os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 
 # ── Frame overlay helper ─────────────────────────────
-def _estimate_height_new(det, frame_shape):
-    """Estimate height using keypoint-based height estimator."""
+def _estimate_height_new(det, frame_shape, frame=None, cam_id="cam_local"):
+    """Estimate height using the full precision pipeline."""
     kpts = det.get("keypoints")
     box = det.get("box", [])
     if len(box) < 4:
         return None
     kpts_np = np.array(kpts) if kpts else None
+    calibrator = get_calibrator(cam_id)
+    # Auto-calibrate camera from frame shape if not yet calibrated
+    if not calibrator.is_calibrated and frame is not None:
+        calibrator.auto_calibrate_from_frame(frame.shape)
     result = height_estimator.estimate_height(
-        kpts_np, box, frame_shape, pose_action=det.get("pose_action")
+        kpts_np, box, frame_shape,
+        pose_action=det.get("pose_action"),
+        camera_calibrator=calibrator,
+        depth_estimator=depth_est,
+        quality_analyzer=image_quality,
+        frame=frame,
     )
     return result
 
@@ -141,91 +177,9 @@ def _auto_calibrate_new(det, frame_shape):
 
 def draw_overlays(frame, detections, ref_scale, faces=None, risk_level=None, slowfast_actions=None):
     """
-    Draw rich overlays on the video frame for each detected person:
-    - Height estimate with confidence (~1.72m ±0.05)
-    - Distance estimate (Dist: ~2.3m)
-    - Visibility class (upper body, full body, etc.)
-    - ML pose action (Standing)
-    - SlowFast activity (Climbing 87%)
-    - Face name when recognized
-    - Risk-colour border
+    No-op: overlays are now rendered in the frontend side panel.
+    Returns the raw frame untouched for maximum FPS.
     """
-    risk_colors = {
-        "LOW": (0, 200, 0),       # green
-        "MEDIUM": (0, 200, 255),  # yellow/orange
-        "HIGH": (0, 0, 255),      # red
-    }
-    border_color = risk_colors.get(risk_level, (200, 200, 200))
-
-    face_map = {}  # box_index -> face info
-    if faces:
-        for fi, f in enumerate(faces):
-            face_map[fi] = f  # simple: map face index to detection index
-
-    frame_shape = frame.shape
-
-    for i, det in enumerate(detections):
-        if det.get("class") != "person":
-            continue
-        box = det.get("box", [])
-        if len(box) < 4:
-            continue
-        x1, y1, x2, y2 = [int(v) for v in box]
-
-        # Risk-coloured border
-        cv2.rectangle(frame, (x1, y1), (x2, y2), border_color, 2)
-
-        labels = []
-
-        # SlowFast activity from Kinetics-400 (top-level, most descriptive)
-        if slowfast_actions and len(slowfast_actions) > 0:
-            top = slowfast_actions[0]
-            if top.get("action") and top["action"] != "Loading model..." and top.get("confidence", 0) > 0.1:
-                labels.append(f"Activity: {top['action'].capitalize()} ({top['confidence']*100:.0f}%)")
-
-        # Pose action from YOLOv8-Pose
-        pose = det.get("pose_action", "")
-        if pose and pose != "unknown":
-            labels.append(f"Pose: {pose.capitalize()}")
-
-        # ── Keypoint-based height estimation ──
-        h_result = _estimate_height_new(det, frame_shape)
-        if h_result and h_result.get("height_m") and h_result.get("confidence", 0) > 0.25:
-            h_m = h_result["height_m"]
-            margin = h_result.get("margin_m", 0.10)
-            conf = h_result.get("confidence", 0)
-            # Show height with margin
-            if conf >= 0.6:
-                labels.append(f"Height: {h_m}m \u00b1{margin}m")
-            else:
-                labels.append(f"Height: ~{h_m}m (est)")
-            det["_height_m"] = h_m  # stash for event saving
-
-            # Distance estimate
-            dist = h_result.get("distance_m")
-            if dist:
-                labels.append(f"Dist: ~{dist}m")
-
-            # Visibility class (only show if partial)
-            vis = h_result.get("visibility", "")
-            if vis and vis not in ("full_body", "unknown"):
-                vis_label = vis.replace("_", " ").title()
-                labels.append(f"Visible: {vis_label}")
-
-        # Face name
-        face = face_map.get(i)
-        if face and face.get("name") and face["name"] != "unknown":
-            labels.append(f"{face['name']} ({face['score']*100:.0f}%)")
-
-        # Draw labels above bounding box
-        for j, lbl in enumerate(labels):
-            y_pos = max(12, y1 - 10 - (j * 22))
-            # background rectangle
-            (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(frame, (x1, y_pos - th - 4), (x1 + tw + 6, y_pos + 4), (0, 0, 0), -1)
-            cv2.putText(frame, lbl, (x1 + 3, y_pos),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-
     return frame
 
 # ── Person Tracker (per-camera) ──────────────────────
@@ -304,13 +258,15 @@ def _compute_risk(faces, actions):
     score = 0
     # Face signals
     if faces:
+        all_unknown = True
         for f in faces:
-            if f.get("name") == "unknown" or f.get("user_id") is None:
-                score += 2  # unknown person = high
-            # known person = no penalty
+            if f.get("name") and f["name"] != "unknown" and f.get("user_id"):
+                all_unknown = False  # known person = no penalty
+        if all_unknown:
+            score += 1  # unknown person = mild risk
     else:
-        score += 1  # no face detected = medium
-    # Action signals
+        score += 1  # no face detected = mild risk
+    # Action signals — only high-risk temporal behaviors
     if actions:
         worst = actions[0] if len(actions) == 1 else (
             "loitering" if "loitering" in actions else
@@ -318,13 +274,13 @@ def _compute_risk(faces, actions):
             "visitor" if "visitor" in actions else "passing"
         )
         if worst == "loitering":
-            score += 2
+            score += 3  # loitering 60s+ is genuinely suspicious
         elif worst == "lingering":
-            score += 1
-    # Risk level
-    if score >= 3:
+            score += 1  # lingering 15s is normal, slight bump
+    # Risk level (more conservative thresholds)
+    if score >= 4:
         level = "HIGH"
-    elif score >= 1:
+    elif score >= 2:
         level = "MEDIUM"
     else:
         level = "LOW"
@@ -332,7 +288,31 @@ def _compute_risk(faces, actions):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "demo_mode": DEMO_MODE}
+
+@app.get("/api/system/info")
+def system_info():
+    """System info for the landing/portfolio page."""
+    return jsonify({
+        "demo_mode": DEMO_MODE,
+        "models": {
+            "pose": "YOLOv8n-Pose (COCO 17-keypoint)",
+            "activity": "SlowFast R50 (Kinetics-400)",
+            "depth": "MiDaS v3.1",
+            "face": "ArcFace (DeepFace)",
+        },
+        "features": [
+            "Real-time pose estimation & action recognition",
+            "Precision height measurement (±3-5cm)",
+            "Monocular depth estimation",
+            "Face recognition & enrollment",
+            "Multi-camera support (USB/IP/RTSP)",
+            "Per-person Kalman-filtered tracking",
+            "Camera lens distortion correction",
+            "Image quality-gated confidence scoring",
+            "Risk level assessment",
+        ],
+    })
 
 @app.get("/activity_status")
 def activity_status():
@@ -341,10 +321,11 @@ def activity_status():
 # ── Shared state between streaming loop and ML worker ──────────
 _latest_frame = None          # raw BGR frame from camera, updated every read
 _latest_frame_lock = threading.Lock()
-_cached_overlay_data = {      # ML results cached for overlay drawing
+_cached_overlay_data = {      # ML results cached for API + overlay
     "detections": [],
     "risk_level": "LOW",
     "sf_actions": [],
+    "height_data": [],           # per-person height/distance/visibility
 }
 
 def _ml_worker():
@@ -407,17 +388,31 @@ def _ml_worker():
         for d in detections:
             _auto_calibrate_new(d, frame.shape)
 
-        # Push to SlowFast buffer
+        # Push to SlowFast buffer and depth estimator
         activity_recognizer.push_frame(frame)
+        depth_est.push_frame(frame)
 
         # Get SlowFast actions (returns cached, non-blocking)
         sf_actions = activity_recognizer.get_actions()
         risk_lvl = activity_state.get("risk_level", "LOW")
 
-        # Update cached overlay data for streaming loop
+        # Compute height/distance for each person (for API)
+        height_data = []
+        for d in detections:
+            try:
+                h_res = _estimate_height_new(d, frame.shape, frame=frame, cam_id="cam_local")
+                if h_res:
+                    height_data.append(h_res)
+                else:
+                    height_data.append({})
+            except Exception:
+                height_data.append({})
+
+        # Update cached overlay data for streaming loop + API
         _cached_overlay_data["detections"] = detections
         _cached_overlay_data["risk_level"] = risk_lvl
         _cached_overlay_data["sf_actions"] = sf_actions
+        _cached_overlay_data["height_data"] = height_data
 
         # ── Consecutive detection tracking ──
         if len(detections) > 0:
@@ -477,7 +472,7 @@ def _ml_worker():
 
             try:
                 if len(detections) > 0:
-                    h_res = _estimate_height_new(detections[0], frame.shape)
+                    h_res = _estimate_height_new(detections[0], frame.shape, frame=frame)
                     if h_res and h_res.get("height_m"):
                         event_doc["height_m"] = h_res["height_m"]
                         event_doc["height_confidence"] = h_res.get("confidence", 0)
@@ -617,16 +612,8 @@ def _camera_reader():
         with _latest_frame_lock:
             _latest_frame = frame
 
-        # Draw cached ML overlays (very cheap — just rectangles + text)
-        overlay = _cached_overlay_data
-        display = draw_overlays(
-            frame.copy(), overlay["detections"], reference_scale,
-            risk_level=overlay["risk_level"],
-            slowfast_actions=overlay["sf_actions"],
-        )
-
-        # Encode once and store
-        _, buffer = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        # Encode raw frame (no overlays) for maximum FPS
+        _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         with _display_frame_lock:
             _display_frame = buffer.tobytes()
 
@@ -654,11 +641,78 @@ def generate_frames():
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
         )
-        time.sleep(0.033)  # ~30 FPS cap per client
+        time.sleep(0.016)  # ~60 FPS cap per client
 
 @app.route("/video_feed")
 def video_feed():
     return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/api/detections")
+def get_detections():
+    """
+    Return real-time detection data as JSON for the frontend side panel.
+    Uses SlowFast activity when confident, falls back to YOLO pose otherwise.
+    """
+    overlay = _cached_overlay_data
+    detections = overlay.get("detections", [])
+    sf_actions = overlay.get("sf_actions", [])
+    height_data = overlay.get("height_data", [])
+    risk_level = overlay.get("risk_level", "LOW")
+
+    persons = []
+    for i, det in enumerate(detections):
+        if det.get("class") != "person":
+            continue
+        h_info = height_data[i] if i < len(height_data) else {}
+        person = {
+            "confidence": det.get("confidence", 0),
+            "pose": det.get("pose_action", "unknown"),
+            "height_m": h_info.get("height_m"),
+            "raw_height_m": h_info.get("raw_height_m"),
+            "height_confidence": h_info.get("confidence"),
+            "margin_m": h_info.get("margin_m"),
+            "distance_m": h_info.get("distance_m"),
+            "visibility": h_info.get("visibility", "unknown"),
+            "quality_score": h_info.get("quality_score"),
+            "depth_method": h_info.get("depth_method"),
+            "calibration": h_info.get("calibration"),
+            "method": h_info.get("method"),
+            "kalman_updates": h_info.get("kalman_updates", 0),
+        }
+        persons.append(person)
+
+    # SlowFast now returns ONLY security-relevant actions (pre-filtered).
+    # Its own MIN_CONFIDENCE already gates garbage, so we trust its output.
+    ACTIVITY_CONF_THRESHOLD = 0.08
+    activities = []
+    for a in sf_actions:
+        if (a.get("action")
+            and a["action"] != "Loading model..."
+            and a.get("confidence", 0) >= ACTIVITY_CONF_THRESHOLD):
+            activities.append({
+                "action": a["action"],
+                "confidence": a.get("confidence", 0),
+            })
+
+    # Fallback: if no confident SlowFast activity, use YOLO pose as the activity
+    if not activities and persons:
+        pose = persons[0].get("pose", "unknown")
+        if pose and pose != "unknown":
+            activities.append({
+                "action": pose.replace("_", " "),
+                "confidence": 0.9,  # pose-based, high confidence
+            })
+        else:
+            activities.append({"action": "idle", "confidence": 1.0})
+
+    return jsonify({
+        "persons": persons,
+        "activities": activities,
+        "risk_level": risk_level,
+        "person_count": len(persons),
+        "model_ready": activity_recognizer.is_ready,
+    })
 
 
 @app.post("/camera/pause")
@@ -977,6 +1031,119 @@ def stats():
     return jsonify({"events_last_hour": events_last_hour, "events_today": events_today})
 
 
+# =====================================================================
+#  CAMERA CALIBRATION API
+# =====================================================================
+
+@app.get("/api/calibrate/presets")
+def calibrate_presets():
+    """List available camera presets."""
+    return jsonify(list_camera_presets())
+
+
+@app.post("/api/calibrate/preset")
+def calibrate_preset():
+    """Apply a preset camera profile. JSON: { camera_id?, preset_name }"""
+    data = request.get_json(silent=True) or {}
+    cam_id = data.get("camera_id", "cam_local")
+    preset_name = data.get("preset_name", "")
+    if not preset_name:
+        return jsonify({"error": "Provide 'preset_name'"}), 400
+    try:
+        calibrator = get_calibrator(cam_id)
+        info = calibrator.load_preset(preset_name)
+        return jsonify(info)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/calibrate/manual")
+def calibrate_manual():
+    """Set camera parameters manually.
+    JSON: { camera_id?, frame_width, frame_height, fov_h_deg?, focal_mm?, sensor_w_mm?, dist_coeffs? }
+    """
+    data = request.get_json(silent=True) or {}
+    cam_id = data.get("camera_id", "cam_local")
+    try:
+        calibrator = get_calibrator(cam_id)
+        info = calibrator.set_manual_params(
+            frame_width=int(data.get("frame_width", 640)),
+            frame_height=int(data.get("frame_height", 480)),
+            fov_h_deg=data.get("fov_h_deg"),
+            focal_mm=data.get("focal_mm"),
+            sensor_w_mm=data.get("sensor_w_mm"),
+            dist_coeffs=data.get("dist_coeffs"),
+        )
+        return jsonify(info)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.post("/api/calibrate/checkerboard")
+def calibrate_checkerboard():
+    """Calibrate from checkerboard images.
+    JSON: { camera_id?, images_base64: [dataurl,...], board_size?: [9,6], square_size_mm?: 25 }
+    """
+    data = request.get_json(silent=True) or {}
+    cam_id = data.get("camera_id", "cam_local")
+    images_b64 = data.get("images_base64", [])
+    board_size = tuple(data.get("board_size", [9, 6]))
+    square_size = float(data.get("square_size_mm", 25.0))
+
+    if len(images_b64) < 3:
+        return jsonify({"error": "Need at least 3 checkerboard images"}), 400
+
+    # Decode images
+    images = []
+    for b64 in images_b64:
+        try:
+            if "," in b64:
+                b64 = b64.split(",")[1]
+            img_bytes = base64.b64decode(b64)
+            arr = np.frombuffer(img_bytes, np.uint8)
+            img = cv2_local.imdecode(arr, cv2_local.IMREAD_COLOR)
+            if img is not None:
+                images.append(img)
+        except Exception:
+            continue
+
+    if len(images) < 3:
+        return jsonify({"error": f"Only {len(images)} valid images decoded (need ≥ 3)"}), 400
+
+    try:
+        calibrator = get_calibrator(cam_id)
+        info = calibrator.calibrate_from_checkerboard(images, board_size, square_size)
+        return jsonify(info)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.get("/api/calibrate/status")
+def calibrate_status():
+    """Get calibration status for a camera. Query param: ?camera_id=cam_local"""
+    cam_id = request.args.get("camera_id", "cam_local")
+    calibrator = get_calibrator(cam_id)
+    info = calibrator.get_calibration_info()
+    info["depth_estimator"] = depth_est.get_status()
+    return jsonify(info)
+
+
+@app.post("/api/calibrate/reset")
+def calibrate_reset():
+    """Reset calibration for a camera. JSON: { camera_id? }"""
+    data = request.get_json(silent=True) or {}
+    cam_id = data.get("camera_id", "cam_local")
+    calibrator = get_calibrator(cam_id)
+    calibrator.reset()
+    # Also reset height estimator's legacy calibration
+    height_estimator.reset_calibration()
+    # Reset depth scale
+    depth_est.reset_scale()
+    return jsonify({"ok": True, "camera_id": cam_id})
+
+
 from flask import send_from_directory
 
 @app.route("/api/screenshots/<path:filename>")
@@ -1194,6 +1361,7 @@ def _generate_cam_feed(cam_entry):
 
         # Push frame to SlowFast buffer for activity recognition
         activity_recognizer.push_frame(frame)
+        depth_est.push_frame(frame)
 
         if len(detections) > 0:
             cam_consec += 1
@@ -1258,7 +1426,7 @@ def _generate_cam_feed(cam_entry):
             # Estimate height
             try:
                 if len(detections) > 0:
-                    h_res = _estimate_height_new(detections[0], frame.shape)
+                    h_res = _estimate_height_new(detections[0], frame.shape, frame=frame, cam_id=cam_id)
                     if h_res and h_res.get("height_m"):
                         event_doc["height_m"] = h_res["height_m"]
                         event_doc["height_confidence"] = h_res.get("confidence", 0)
@@ -1356,12 +1524,7 @@ def _generate_cam_feed(cam_entry):
         if cam_cooldown > 0:
             cam_cooldown -= 1
 
-        # ── Draw rich overlays on frame ──
-        risk_lvl = activity_state.get("risk_level", "LOW")
-        sf_actions = activity_recognizer.get_actions()
-        frame = draw_overlays(frame, detections, reference_scale, risk_level=risk_lvl, slowfast_actions=sf_actions)
-
-        # ── Encode frame with annotations ─────────────────
+        # ── Encode raw frame (no overlays) for max FPS ──
         _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         yield (
             b"--frame\r\n"

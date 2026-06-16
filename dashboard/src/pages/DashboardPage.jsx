@@ -3,6 +3,219 @@ import { useEffect, useState, useCallback, useRef } from "react";
 // ── Layout modes ──────────────────────────────────────────────────
 const LAYOUT = { SPOTLIGHT: "spotlight", GRID: "grid", LIST: "list" };
 
+// ── Detection Info Panel (OUTSIDE component to avoid remount flicker) ──
+function DetectionPanel({ detections, riskClass }) {
+  const { persons, activities, risk_level, person_count, model_ready } = detections;
+  const topActivity = activities.length > 0 ? activities[0] : null;
+  const person = persons.length > 0 ? persons[0] : null;
+
+  return (
+    <div className="detection-panel">
+      <div className="detection-panel-header">
+        <h3>Live Detection</h3>
+        <span className={`detection-status-dot ${person_count > 0 ? "active" : ""}`} />
+      </div>
+
+      <div className="detection-panel-body">
+        {/* Person count */}
+        <div className="det-row">
+          <span className="det-icon">👤</span>
+          <span className="det-label">Persons</span>
+          <span className="det-value">{person_count}</span>
+        </div>
+
+        {/* Activity */}
+        <div className="det-row">
+          <span className="det-icon">🎯</span>
+          <span className="det-label">Activity</span>
+          <span className="det-value det-activity">
+            {topActivity
+              ? topActivity.action.charAt(0).toUpperCase() + topActivity.action.slice(1)
+              : model_ready ? "Idle" : "Loading…"
+            }
+          </span>
+        </div>
+        {topActivity && (
+          <div className="det-bar-container">
+            <div
+              className="det-bar"
+              style={{ width: `${Math.min(100, topActivity.confidence * 100)}%` }}
+            />
+            <span className="det-bar-label">{(topActivity.confidence * 100).toFixed(0)}%</span>
+          </div>
+        )}
+
+        {/* Secondary activities */}
+        {activities.length > 1 && (
+          <div className="det-secondary-activities">
+            {activities.slice(1).map((a, i) => (
+              <div key={i} className="det-secondary-row">
+                <span className="det-secondary-name">
+                  {a.action.charAt(0).toUpperCase() + a.action.slice(1)}
+                </span>
+                <span className="det-secondary-conf">
+                  {(a.confidence * 100).toFixed(0)}%
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Divider */}
+        <div className="det-divider" />
+
+        {/* Pose */}
+        <div className="det-row">
+          <span className="det-icon">🧍</span>
+          <span className="det-label">Pose</span>
+          <span className="det-value">
+            {person ? person.pose.charAt(0).toUpperCase() + person.pose.slice(1).replace("_", " ") : "—"}
+          </span>
+        </div>
+
+        {/* Height */}
+        <div className="det-row">
+          <span className="det-icon">📏</span>
+          <span className="det-label">Height</span>
+          <span className="det-value">
+            {person && person.height_m
+              ? `~${person.height_m}m`
+              : "—"
+            }
+            {person && person.margin_m && (
+              <span className="det-margin"> ±{person.margin_m}m</span>
+            )}
+          </span>
+        </div>
+
+        {/* Distance */}
+        <div className="det-row">
+          <span className="det-icon">📐</span>
+          <span className="det-label">Distance</span>
+          <span className="det-value">
+            {person && person.distance_m ? `~${person.distance_m}m` : "—"}
+          </span>
+        </div>
+
+        {/* Visibility */}
+        <div className="det-row">
+          <span className="det-icon">👁</span>
+          <span className="det-label">Visible</span>
+          <span className="det-value">
+            {person && person.visibility && person.visibility !== "unknown"
+              ? person.visibility.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
+              : "—"
+            }
+          </span>
+        </div>
+
+        {/* Divider */}
+        <div className="det-divider" />
+
+        {/* Risk */}
+        <div className="det-row">
+          <span className="det-icon">⚡</span>
+          <span className="det-label">Risk</span>
+          <span className={`badge ${riskClass(risk_level)}`}
+            style={{ fontSize: 10, padding: "2px 8px" }}
+          >
+            {risk_level}
+          </span>
+        </div>
+
+        {/* Detection confidence */}
+        {person && (
+          <div className="det-row">
+            <span className="det-icon">🔍</span>
+            <span className="det-label">Confidence</span>
+            <span className="det-value">{(person.confidence * 100).toFixed(0)}%</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Video feed with demo fallback ──
+const DEMO_VIDEO = "https://github.com/intel-iot-devkit/sample-videos/raw/master/person-bicycle-car-detection.mp4";
+
+function DemoFeedVideo({ src, alt }) {
+  const [useFallback, setUseFallback] = useState(false);
+  const videoRef = useRef(null);
+
+  useEffect(() => {
+    if (useFallback) {
+      const interval = setInterval(() => {
+        if (videoRef.current) {
+          window.__demoVideoTime = videoRef.current.currentTime;
+        }
+      }, 200);
+      return () => clearInterval(interval);
+    }
+  }, [useFallback]);
+
+  if (useFallback && !import.meta.env.DEV) {
+    return (
+      <video
+        ref={videoRef}
+        src={DEMO_VIDEO}
+        autoPlay
+        loop
+        muted
+        playsInline
+        style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+      />
+    );
+  }
+  return <img src={src} alt={alt} loading="lazy" onError={() => {
+    // Only fall back to demo video in production
+    if (!import.meta.env.DEV) setUseFallback(true);
+  }} />;
+}
+
+// ── Camera Feed Component (OUTSIDE to avoid remount) ──
+function CameraFeed({ cam, isMain = false, onClick, isSelected, layoutMode }) {
+  return (
+    <div
+      onClick={onClick}
+      className={`feed-container cursor-pointer ${isSelected && layoutMode === LAYOUT.SPOTLIGHT
+        ? "ring-1 ring-indigo-500/40"
+        : ""
+        }`}
+      style={!isMain ? { height: 120 } : {}}
+    >
+    {cam.status === "online" ? (
+        <DemoFeedVideo src={`/api/cameras/${cam.id}/feed`} alt={cam.name} />
+      ) : (
+        <div style={{
+          width: "100%", height: "100%",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          color: "var(--text-muted)",
+        }}>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 24, marginBottom: 4 }}>
+              {cam.status === "paused" ? "⏸" : "◉"}
+            </div>
+            <div style={{ fontSize: 10 }}>
+              {cam.status === "paused" ? "Paused" : "Offline"}
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="feed-overlay">
+        <span className={`cam-status-dot ${cam.status === "online" ? "online" : ""}`}
+          style={cam.status !== "online" ? {
+            background: cam.status === "paused" ? "var(--warning)" : "var(--danger)"
+          } : {}}
+        />
+        <span className="cam-name">{cam.name}</span>
+        <span className="cam-type">{cam.type}</span>
+      </div>
+    </div>
+  );
+}
+
+
 export default function DashboardPage() {
   const [activity, setActivity] = useState({
     active: false,
@@ -21,6 +234,15 @@ export default function DashboardPage() {
   const [newCamName, setNewCamName] = useState("");
   const [newCamSource, setNewCamSource] = useState("");
   const [addingCam, setAddingCam] = useState(false);
+
+  // ── Real-time detections from /api/detections ──────────────
+  const [detections, setDetections] = useState({
+    persons: [],
+    activities: [],
+    risk_level: "LOW",
+    person_count: 0,
+    model_ready: false,
+  });
 
   // ── Notification permission ──────────────────────────────────
   const lastNotifiedRef = useRef(null);
@@ -56,6 +278,23 @@ export default function DashboardPage() {
     };
     fetchStatus();
     const id = setInterval(fetchStatus, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // ── Poll real-time detections ──────────────────────────────
+  useEffect(() => {
+    const fetchDetections = async () => {
+      try {
+        const res = await fetch("/api/detections");
+        if (!res.ok) return;
+        const data = await res.json();
+        setDetections(data);
+      } catch (err) {
+        // silently ignore — will retry
+      }
+    };
+    fetchDetections();
+    const id = setInterval(fetchDetections, 500);
     return () => clearInterval(id);
   }, []);
 
@@ -152,53 +391,11 @@ export default function DashboardPage() {
     } catch { return "—"; }
   };
 
-  const feedUrl = (camId) => `/api/cameras/${camId}/feed`;
-
   const riskClass = (level) => {
     if (level === "HIGH") return "badge-danger";
     if (level === "MEDIUM") return "badge-warning";
     return "badge-success";
   };
-
-  // ── Camera Feed Component ────────────────────────────────────
-  const CameraFeed = ({ cam, isMain = false, onClick }) => (
-    <div
-      onClick={onClick}
-      className={`feed-container cursor-pointer ${selectedCam === cam.id && layout === LAYOUT.SPOTLIGHT
-        ? "ring-1 ring-indigo-500/40"
-        : ""
-        }`}
-      style={!isMain ? { height: 120 } : {}}
-    >
-      {cam.status === "online" ? (
-        <img src={feedUrl(cam.id)} alt={cam.name} loading="lazy" />
-      ) : (
-        <div style={{
-          width: "100%", height: "100%",
-          display: "flex", alignItems: "center", justifyContent: "center",
-          color: "var(--text-muted)",
-        }}>
-          <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 24, marginBottom: 4 }}>
-              {cam.status === "paused" ? "⏸" : "◉"}
-            </div>
-            <div style={{ fontSize: 10 }}>
-              {cam.status === "paused" ? "Paused" : "Offline"}
-            </div>
-          </div>
-        </div>
-      )}
-      <div className="feed-overlay">
-        <span className={`cam-status-dot ${cam.status === "online" ? "online" : ""}`}
-          style={cam.status !== "online" ? {
-            background: cam.status === "paused" ? "var(--warning)" : "var(--danger)"
-          } : {}}
-        />
-        <span className="cam-name">{cam.name}</span>
-        <span className="cam-type">{cam.type}</span>
-      </div>
-    </div>
-  );
 
   // ── Render camera area ───────────────────────────────────────
   const renderCameraPanel = () => {
@@ -221,7 +418,7 @@ export default function DashboardPage() {
       return (
         <div style={{ display: "flex", gap: 10 }}>
           <div style={{ flex: 1 }}>
-            <CameraFeed cam={main} isMain onClick={() => { }} />
+            <CameraFeed cam={main} isMain onClick={() => { }} isSelected={true} layoutMode={layout} />
           </div>
           {cameras.length > 1 && (
             <div style={{
@@ -233,6 +430,8 @@ export default function DashboardPage() {
                   key={cam.id}
                   cam={cam}
                   onClick={() => setSelectedCam(cam.id)}
+                  isSelected={selectedCam === cam.id}
+                  layoutMode={layout}
                 />
               ))}
             </div>
@@ -254,6 +453,8 @@ export default function DashboardPage() {
               cam={cam}
               isMain
               onClick={() => setSelectedCam(cam.id)}
+              isSelected={selectedCam === cam.id}
+              layoutMode={layout}
             />
           ))}
         </div>
@@ -264,7 +465,14 @@ export default function DashboardPage() {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
         {cameras.map((cam) => (
-          <CameraFeed key={cam.id} cam={cam} isMain onClick={() => setSelectedCam(cam.id)} />
+          <CameraFeed
+            key={cam.id}
+            cam={cam}
+            isMain
+            onClick={() => setSelectedCam(cam.id)}
+            isSelected={selectedCam === cam.id}
+            layoutMode={layout}
+          />
         ))}
       </div>
     );
@@ -302,9 +510,12 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* ── Camera Feeds ─────────────────────────────────── */}
-      <div className="layout-transition">
-        {renderCameraPanel()}
+      {/* ── Camera Feed + Detection Panel ─────────────────── */}
+      <div style={{ display: "flex", gap: 12 }}>
+        <div style={{ flex: 1 }} className="layout-transition">
+          {renderCameraPanel()}
+        </div>
+        <DetectionPanel detections={detections} riskClass={riskClass} />
       </div>
 
       {/* ── Metrics Strip ────────────────────────────────── */}
@@ -360,7 +571,9 @@ export default function DashboardPage() {
             </div>
             <div className="status-row">
               <span className="status-label">Activity AI</span>
-              <span className="status-value" style={{ color: "var(--success)" }}>SlowFast R50</span>
+              <span className="status-value" style={{ color: detections.model_ready ? "var(--success)" : "var(--warning)" }}>
+                {detections.model_ready ? "SlowFast R50" : "Loading…"}
+              </span>
             </div>
             <div className="status-row">
               <span className="status-label">Last Event</span>

@@ -28,6 +28,7 @@ backend/yolov8n-pose.pt
 
 # ── Screenshots & media ────────────────────
 backend/screenshots/
+backend/static/screenshots/
 
 # ── IDE / OS ────────────────────────────────
 .vscode/
@@ -44,3 +45,12 @@ npm-debug.log*
 
 # ── Misc ────────────────────────────────────
 .gemini/
+test_video.mp4
+analyze_video.py
+yolov8n.pt
+
+# ── Calibration data (per-camera, regenerated) ─
+backend/calibration_data/
+
+# ── Docker ──────────────────────────────────
+docker-compose.override.yml

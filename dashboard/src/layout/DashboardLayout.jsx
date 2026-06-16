@@ -3,7 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 export default function DashboardLayout({ children }) {
   const location = useLocation();
   const navItems = [
-    { to: "/", label: "Dashboard", icon: "⬡" },
+    { to: "/dashboard", label: "Dashboard", icon: "⬡" },
     { to: "/cameras", label: "Cameras", icon: "◉" },
     { to: "/events", label: "Events", icon: "⚡" },
     { to: "/metrics", label: "Analytics", icon: "◈" },

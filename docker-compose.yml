@@ -1,0 +1,67 @@
+# ═══════════════════════════════════════════════════════════════
+#  AI Security System — Docker Compose (Database + Dashboard)
+#  Backend runs natively for camera access
+# ═══════════════════════════════════════════════════════════════
+#
+#  Why not containerize the backend?
+#    Docker on Windows can't access USB webcams.
+#    The backend needs direct camera access, so it runs natively.
+#    MongoDB and the dashboard run in Docker (clean, no install needed).
+#
+#  Quick start:
+#    1. docker compose up -d           ← starts MongoDB + Dashboard
+#    2. cd backend && python app.py    ← starts backend with camera
+#
+#  Access:
+#    Dashboard:  http://localhost:3000
+#    Backend:    http://localhost:5000
+#
+# ═══════════════════════════════════════════════════════════════
+
+services:
+  # ── MongoDB ─────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7
+    container_name: security-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: security_system
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - security-net
+
+  # ── Dashboard (React + nginx) ───────────────────────────────
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: security-dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    # The nginx config proxies /api/* to host.docker.internal:5000
+    # which reaches the natively-running backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - security-net
+
+volumes:
+  mongo_data:
+    name: security-mongo-data
+
+networks:
+  security-net:
+    name: security-network
+    driver: bridge
