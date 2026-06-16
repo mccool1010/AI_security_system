@@ -116,10 +116,12 @@ run.bat
 ## 📸 Screenshots
 
 ### Live Monitoring Dashboard
-![Live Monitoring Dashboard](docs/dashboard.png)
+<img width="1080" height="997" alt="Screenshot 2026-06-16 at 15-22-27 dashboard" src="https://github.com/user-attachments/assets/d54469cb-4f09-44b6-adb9-e21f259bb6ec" />
+
 
 ### Analytics & Events Panel
-![Analytics Panel](docs/analytics.png)
+<img width="1080" height="997" alt="Screenshot 2026-06-16 at 15-22-39 dashboard" src="https://github.com/user-attachments/assets/a90a2901-08a4-4aee-93ce-81e2d0f04561" />
+
 
 ---
 
