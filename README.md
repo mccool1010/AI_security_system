@@ -115,9 +115,11 @@ run.bat
 
 ## 📸 Screenshots
 
-| Live Monitoring | Analytics & Events |
-|:---:|:---:|
-| ![Dashboard Layout](docs/dashboard.png) | ![Analytics Panel](docs/analytics.png) |
+### Live Monitoring Dashboard
+![Live Monitoring Dashboard](docs/dashboard.png)
+
+### Analytics & Events Panel
+![Analytics Panel](docs/analytics.png)
 
 ---
 
