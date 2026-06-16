@@ -79,6 +79,23 @@ npm run dev
 ```
 *(Leave this window open. It will provide a local URL, usually `http://localhost:5173`).*
 
+## 🐳 Option C: Using Docker (Recommended for Production)
+
+If you prefer containerization, this project includes a complete Docker setup that automatically spins up the Backend, Frontend, and a **MongoDB** database instance for persistent event storage.
+
+1. Make sure you have Docker and Docker Compose installed.
+2. From the root directory of the project, simply run:
+   ```bash
+   docker-compose up --build
+   ```
+3. Docker will automatically:
+   - Build and start the Python Backend container.
+   - Build and start the React Frontend container.
+   - Pull and start the official **MongoDB** container.
+   - Connect the backend seamlessly to the MongoDB database to log all security events.
+
+Once the containers are running, you can access the dashboard at `http://localhost:80`.
+
 ---
 
 ## 🛑 What Needs to be Kept Running?
