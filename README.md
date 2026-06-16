@@ -115,11 +115,9 @@ run.bat
 
 ## 📸 Screenshots
 
-*(Replace these placeholders with actual screenshots of your dashboard)*
-
 | Live Monitoring | Analytics & Events |
 |:---:|:---:|
-| ![Dashboard Layout](https://via.placeholder.com/600x350/1A1A24/FFFFFF?text=Dashboard+UI+Screenshot) | ![Analytics Panel](https://via.placeholder.com/600x350/1A1A24/FFFFFF?text=Analytics+Screenshot) |
+| ![Dashboard Layout](docs/dashboard.png) | ![Analytics Panel](docs/analytics.png) |
 
 ---
 
