@@ -78,38 +78,15 @@ graph TD
 
 ## 🚀 Getting Started
 
-### Prerequisites
-- Python 3.9+
-- Node.js 18+
-- (Optional) Docker
+📖 **[Read the complete step-by-step setup guide in HOW_TO_RUN.md](HOW_TO_RUN.md)**
 
-### 1. Start the Backend
-The backend runs the complete ML pipeline via Flask.
-```bash
-cd backend
-python -m venv venv
-venv\Scripts\activate  # Windows
-pip install -r requirements.txt
-
-# Start the Flask server
-python app.py
-```
-
-### 2. Start the Frontend
-The frontend is a modern React/Vite SPA.
-```bash
-cd dashboard
-npm install
-
-# Start the development server
-npm run dev
-```
-
-### 3. All-in-One Launcher (Windows)
-Simply run the provided batch script to launch both services simultaneously:
+### Quick Start (Windows)
+If you already have Python and Node.js installed:
 ```cmd
 run.bat
 ```
+
+
 
 ---
 
