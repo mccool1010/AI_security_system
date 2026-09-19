@@ -31,6 +31,8 @@ _DEFAULT_VIDEO = os.path.join(_SAMPLE_DIR, "sample_pedestrian.mp4")
 
 # Custom video path from environment
 DEMO_VIDEO_PATH = os.environ.get("DEMO_VIDEO", _DEFAULT_VIDEO)
+# Playback rate: unset = the file's own FPS, 0 = as fast as possible (throughput benchmarks)
+DEMO_FPS = os.environ.get("DEMO_FPS")
 
 # Publicly available sample pedestrian video (Creative Commons)
 # This is a short clip of people walking — perfect for demonstrating the system
@@ -103,7 +105,8 @@ class DemoVideoCapture:
 
         if self._opened:
             self._fps = self._cap.get(cv2.CAP_PROP_FPS) or 30
-            self._frame_delay = 1.0 / self._fps
+            play_fps = float(DEMO_FPS) if DEMO_FPS not in (None, "") else self._fps
+            self._frame_delay = 1.0 / play_fps if play_fps > 0 else 0.0
             total_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
             duration = total_frames / self._fps if self._fps > 0 else 0
             print(f"  🎬 Demo video loaded: {self.video_path} "

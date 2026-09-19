@@ -38,30 +38,17 @@ node --version
 echo         OK
 echo.
 
-:: ── Create Python virtual environment ───────────────────────
-echo  [3/5] Setting up Python virtual environment...
-cd /d "%~dp0backend"
-if not exist "venv" (
-    echo         Creating venv...
-    python -m venv venv
-)
-echo         Activating venv...
-call venv\Scripts\activate.bat
-
-:: ── Install Python dependencies ─────────────────────────────
+:: ── Backend: venv + PyTorch (GPU if available) + dependencies ──
+echo  [3/5] Setting up the backend in backend\venv ...
 echo  [4/5] Installing Python dependencies (this may take a while)...
-echo.
-pip install --upgrade pip >nul 2>&1
-pip install -r requirements.txt
+call "%~dp0backend\install_backend.bat"
 if %errorlevel% neq 0 (
     echo.
-    echo  WARNING: Some Python packages failed to install.
-    echo  You may need to install PyTorch manually:
-    echo  https://pytorch.org/get-started/locally/
+    echo  ERROR: backend installation failed - see the messages above.
     echo.
+    pause
+    exit /b 1
 )
-echo.
-echo         Python dependencies installed.
 echo.
 
 :: ── Install Node.js dependencies ────────────────────────────
@@ -76,9 +63,6 @@ if %errorlevel% neq 0 (
 echo.
 echo         Dashboard dependencies installed.
 echo.
-
-:: ── Create screenshots directory ────────────────────────────
-if not exist "%~dp0backend\screenshots" mkdir "%~dp0backend\screenshots"
 
 :: ── Done ────────────────────────────────────────────────────
 echo.

@@ -1,349 +1,213 @@
-# detector.py — YOLOv8-Pose + temporal motion tracking for rich action classification
-from ultralytics import YOLO
-import torch
-import cv2
-import numpy as np
-import math
-from collections import deque
+"""YOLOv8-Pose person detection + keypoint-based posture classification.
 
-# ── Model setup ──────────────────────────────────────────────────
-MODEL_PATH = "yolov8n-pose.pt"
+detect() only runs the model. Posture is classified per *track* (see
+tracking.py) because it needs a short keypoint history with timestamps.
+
+All speeds are in body-heights per second, so thresholds do not depend on
+camera resolution, subject distance or pipeline FPS.
+"""
+import math
+import os
+
+import numpy as np
+import torch
+from ultralytics import YOLO
+
+MODEL_PATH = os.environ.get("POSE_MODEL", "yolov8n-pose.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+HALF = DEVICE == "cuda"
 
 model = YOLO(MODEL_PATH)
 model.to(DEVICE)
 
-# ── COCO keypoint indices ─────────────────────────────────────────
-KP_NOSE           = 0
-KP_LEFT_EYE       = 1
-KP_RIGHT_EYE      = 2
-KP_LEFT_EAR       = 3
-KP_RIGHT_EAR      = 4
-KP_LEFT_SHOULDER  = 5
-KP_RIGHT_SHOULDER = 6
-KP_LEFT_ELBOW     = 7
-KP_RIGHT_ELBOW    = 8
-KP_LEFT_WRIST     = 9
-KP_RIGHT_WRIST    = 10
-KP_LEFT_HIP       = 11
-KP_RIGHT_HIP      = 12
-KP_LEFT_KNEE      = 13
-KP_RIGHT_KNEE     = 14
-KP_LEFT_ANKLE     = 15
-KP_RIGHT_ANKLE    = 16
+# COCO keypoint indices
+KP_NOSE = 0
+KP_L_SH, KP_R_SH = 5, 6
+KP_L_EL, KP_R_EL = 7, 8
+KP_L_WR, KP_R_WR = 9, 10
+KP_L_HIP, KP_R_HIP = 11, 12
+KP_L_KN, KP_R_KN = 13, 14
+KP_L_ANK, KP_R_ANK = 15, 16
 
-KP_CONF_MIN = 0.25  # lower than before to handle blurry/low-res footage
+KP_CONF_MIN = 0.25
+KP_CONF_STRICT = 0.5   # joints used for whole-body geometry must be this confident
+MIN_POSE_PX = 48       # below this body height only locomotion is classified
 
-# ── Per-person keypoint history for velocity tracking ─────────────
-# Key: (grid_cx, grid_cy) — coarse person identity from box center
-# Value: deque of (kpts_xy, timestamp)
-_motion_history: dict[tuple, deque] = {}
-_HISTORY_LEN = 8      # frames to keep
-_GRID_SIZE   = 60     # pixels — coarser grid tolerates jitter
+POSES = ("lying_down", "falling", "fighting", "kicking", "hands_raised",
+         "crouching", "bending", "running", "walking", "standing", "unknown")
+
+# Thresholds (body-heights per second unless stated)
+FALL_DOWN_SPEED = 1.0       # shoulders dropping at least this fast
+FIGHT_WRIST_SPEED = 3.0     # wrists moving relative to the hips
+FIGHT_LIMB_SPEED = 1.3      # mean relative speed of all visible limbs
+KICK_ANKLE_SPEED = 1.8
+RUN_SPEED = 1.6             # whole-body translation
+WALK_SPEED = 0.25
 
 
-def _box_key(box):
-    cx = int((box[0] + box[2]) / 2 / _GRID_SIZE)
-    cy = int((box[1] + box[3]) / 2 / _GRID_SIZE)
-    return (cx, cy)
+def detect(frame, conf=0.5, imgsz=640):
+    """Run YOLOv8-Pose on a BGR frame. Returns [{box, confidence, keypoints (17x3 list)}]."""
+    r = model(frame, imgsz=imgsz, conf=conf, device=DEVICE, classes=[0], half=HALF, verbose=False)[0]
+    out = []
+    if r.boxes is None:
+        return out
+    kpts = r.keypoints.data.cpu().numpy() if r.keypoints is not None else None
+    for i, box in enumerate(r.boxes):
+        out.append({
+            "class": "person",
+            "confidence": float(box.conf[0]),
+            "box": [float(v) for v in box.xyxy[0].tolist()],
+            "keypoints": kpts[i].tolist() if kpts is not None and i < len(kpts) else None,
+        })
+    return out
 
 
-def _push_history(box, kpts_np):
-    """Store current keypoints and return per-joint velocity (px/frame)."""
-    key = _box_key(box)
-    if key not in _motion_history:
-        _motion_history[key] = deque(maxlen=_HISTORY_LEN)
-    hist = _motion_history[key]
-    hist.append(kpts_np[:, :2].copy())   # store x,y only (17,2)
-
-    if len(hist) < 2:
-        return np.zeros(17)
-
-    # Mean absolute velocity over available history
-    vel = np.zeros(17)
-    for i in range(1, len(hist)):
-        diff = np.linalg.norm(hist[i] - hist[i - 1], axis=1)  # (17,)
-        vel += diff
-    return vel / (len(hist) - 1)
+def warmup(shape=(480, 640, 3)):
+    detect(np.zeros(shape, dtype=np.uint8))
 
 
-# Prune stale entries every 200 calls
-_prune_counter = 0
-def _prune_history():
-    global _prune_counter
-    _prune_counter += 1
-    if _prune_counter % 200 == 0 and len(_motion_history) > 50:
-        # Keep only the 50 most recently updated (FIFO deque is already bounded)
-        oldest = list(_motion_history.keys())[:len(_motion_history)//2]
-        for k in oldest:
-            del _motion_history[k]
-
-
-# ── Geometry helpers ──────────────────────────────────────────────
-
-def _angle(a, b, c):
-    """Angle at b in degrees."""
-    ba = np.array(a) - np.array(b)
-    bc = np.array(c) - np.array(b)
-    cos_a = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
-    return math.degrees(math.acos(np.clip(cos_a, -1.0, 1.0)))
+# ── helpers ───────────────────────────────────────────────────────
+def _pt(k, i, min_conf=KP_CONF_MIN):
+    return k[i, :2] if k[i, 2] > min_conf else None
 
 
 def _mid(a, b):
-    if a is None and b is None:
-        return None
     if a is None:
         return b
     if b is None:
         return a
-    return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]
+    return (a + b) / 2
 
 
-# ── Rich pose / action classifier ────────────────────────────────
+def _angle(a, b, c):
+    ba, bc = a - b, c - b
+    cos = float(np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6))
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos))))
 
-def _classify_pose(kpts, vel):
+
+def _speed(history, fn, scale):
+    """Mean speed (body-heights/s) of point fn(kpts, box) over the history."""
+    total, dt_sum = 0.0, 0.0
+    for (t0, b0, k0), (t1, b1, k1) in zip(history, list(history)[1:]):
+        p0, p1 = fn(k0, b0), fn(k1, b1)
+        dt = t1 - t0
+        if p0 is None or p1 is None or dt <= 0:
+            continue
+        total += float(np.linalg.norm(p1 - p0))
+        dt_sum += dt
+    return (total / dt_sum / scale) if dt_sum > 0 else 0.0
+
+
+def _down_speed(history, fn, scale):
+    """Signed vertical speed (positive = moving down), body-heights/s, over the history span."""
+    pts = [(t, fn(k, b)) for t, b, k in history]
+    pts = [(t, p) for t, p in pts if p is not None]
+    if len(pts) < 2 or pts[-1][0] - pts[0][0] <= 0:
+        return 0.0
+    return float(pts[-1][1][1] - pts[0][1][1]) / (pts[-1][0] - pts[0][0]) / scale
+
+
+def classify_pose(history, body_scale_px, truncated=False):
+    """Classify posture from [(ts, box, kpts ndarray 17x3), ...] (oldest first).
+
+    body_scale_px: the person's standing height in pixels (max recent box height).
+    truncated: the box touches the frame edge, so whole-body geometry is unreliable.
     """
-    Classify action from 17 COCO keypoints + per-joint velocity.
+    if not history:
+        return "unknown"
+    _, box, k = history[-1]
+    if k is None:
+        return "unknown"
+    scale = max(body_scale_px, 1.0)
 
-    Priority order (most specific / dangerous first):
-      1.  lying_down
-      2.  falling          ← downward torso velocity + body tilt
-      3.  choking_posture  ← both wrists at throat/neck area
-      4.  fighting         ← high velocity + aggressive geometry
-      5.  punching         ← extended arm with high wrist velocity
-      6.  kicking          ← raised leg with high ankle/knee velocity
-      7.  guard_stance     ← boxing/martial-arts guard position
-      8.  struggling       ← erratic high-velocity full-body motion
-      9.  hands_raised     ← both wrists above head (surrender/reach)
-      10. waving           ← one wrist above shoulder, oscillating
-      11. arm_extended     ← static extended arm (pointing/threatening)
-      12. jumping          ← both ankles above hip level
-      13. crouching
-      14. bending
-      15. running
-      16. walking
-      17. standing         ← default
-    """
-    def kp(idx):
-        if kpts[idx][2] > KP_CONF_MIN:
-            return kpts[idx][:2].tolist()
-        return None
+    l_sh, r_sh = _pt(k, KP_L_SH), _pt(k, KP_R_SH)
+    l_hip, r_hip = _pt(k, KP_L_HIP), _pt(k, KP_R_HIP)
+    l_kn, r_kn = _pt(k, KP_L_KN), _pt(k, KP_R_KN)
+    l_ank, r_ank = _pt(k, KP_L_ANK), _pt(k, KP_R_ANK)
+    l_wr, r_wr = _pt(k, KP_L_WR), _pt(k, KP_R_WR)
+    nose = _pt(k, KP_NOSE)
+    mid_sh, mid_hip = _mid(l_sh, r_sh), _mid(l_hip, r_hip)
+    whole_body = not truncated and scale >= MIN_POSE_PX
 
-    # Gather all joints
-    nose      = kp(KP_NOSE)
-    l_sh      = kp(KP_LEFT_SHOULDER);  r_sh    = kp(KP_RIGHT_SHOULDER)
-    l_el      = kp(KP_LEFT_ELBOW);     r_el    = kp(KP_RIGHT_ELBOW)
-    l_wr      = kp(KP_LEFT_WRIST);     r_wr    = kp(KP_RIGHT_WRIST)
-    l_hip     = kp(KP_LEFT_HIP);       r_hip   = kp(KP_RIGHT_HIP)
-    l_kn      = kp(KP_LEFT_KNEE);      r_kn    = kp(KP_RIGHT_KNEE)
-    l_ank     = kp(KP_LEFT_ANKLE);     r_ank   = kp(KP_RIGHT_ANKLE)
+    torso_tilt = None
+    strict_sh = _mid(_pt(k, KP_L_SH, KP_CONF_STRICT), _pt(k, KP_R_SH, KP_CONF_STRICT))
+    strict_hip = _mid(_pt(k, KP_L_HIP, KP_CONF_STRICT), _pt(k, KP_R_HIP, KP_CONF_STRICT))
+    if whole_body and strict_sh is not None and strict_hip is not None:
+        mid_sh, mid_hip = strict_sh, strict_hip
+        d = mid_hip - mid_sh
+        torso_tilt = math.degrees(math.atan2(abs(d[0]), max(d[1], 1e-6)))  # 0 = upright
 
-    mid_sh    = _mid(l_sh, r_sh)
-    mid_hip   = _mid(l_hip, r_hip)
-    mid_kn    = _mid(l_kn, r_kn)
-    mid_ank   = _mid(l_ank, r_ank)
+    box_w, box_h = box[2] - box[0], box[3] - box[1]
+    hist = [h for h in history if h[2] is not None]
 
-    # Velocities for key joints
-    v_l_wr    = vel[KP_LEFT_WRIST]
-    v_r_wr    = vel[KP_RIGHT_WRIST]
-    v_l_ank   = vel[KP_LEFT_ANKLE]
-    v_r_ank   = vel[KP_RIGHT_ANKLE]
-    v_l_kn    = vel[KP_LEFT_KNEE]
-    v_r_kn    = vel[KP_RIGHT_KNEE]
-    v_torso   = (vel[KP_LEFT_SHOULDER] + vel[KP_RIGHT_SHOULDER]) / 2
-    v_overall = float(np.mean(vel))
+    def hip_center(kk, bb):
+        return _mid(_pt(kk, KP_L_HIP), _pt(kk, KP_R_HIP))
 
-    body_w = 1.0
-    if l_sh and r_sh:
-        body_w = max(1.0, abs(l_sh[0] - r_sh[0]))
+    def rel(idx):
+        def f(kk, bb):
+            p, c = _pt(kk, idx), hip_center(kk, bb)
+            return None if p is None or c is None else p - c
+        return f
 
-    # ── 1. Lying down ──────────────────────────────────────────────
-    if mid_sh and mid_hip:
-        dy = abs(mid_hip[1] - mid_sh[1])
-        dx = abs(mid_hip[0] - mid_sh[0])
-        if dx > 0 and dy / (dx + 1e-6) < 0.6:
-            return "lying_down"
+    def box_center(kk, bb):
+        return np.array([(bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2])
 
-    # ── 2. Falling ─────────────────────────────────────────────────
-    # Torso moving fast downward OR body severely tilted + motion
-    if mid_sh and mid_hip and v_torso > 12:
-        return "falling"
-    if mid_sh and mid_hip:
-        dy = mid_hip[1] - mid_sh[1]
-        dx = abs(mid_hip[0] - mid_sh[0])
-        torso_tilt = dx / (dy + 1e-6)
-        if torso_tilt > 0.7 and v_overall > 6:
+    def shoulders(kk, bb):
+        return _mid(_pt(kk, KP_L_SH), _pt(kk, KP_R_SH))
+
+    # 1. Lying down: torso near horizontal, or box much wider than tall
+    if whole_body and ((torso_tilt is not None and torso_tilt > 60)
+                       or (box_w > 1.3 * box_h and box_h < 0.6 * scale and len(hist) >= 3)):
+        return "lying_down"
+
+    # 2. Falling: shoulders dropping fast while the body leans or shrinks
+    if whole_body and len(hist) >= 3:
+        down = _down_speed(hist[-6:], shoulders, scale)
+        if down > FALL_DOWN_SPEED and ((torso_tilt or 0) > 30 or box_h < 0.75 * scale):
             return "falling"
 
-    # ── 3. Choking / Neck-grab posture ─────────────────────────────
-    # Both wrists at or above shoulder height, close to the neck/head region
-    if l_wr and r_wr and mid_sh and nose:
-        neck_y = (mid_sh[1] + nose[1]) / 2
-        l_at_neck = l_wr[1] < neck_y + body_w * 0.3
-        r_at_neck = r_wr[1] < neck_y + body_w * 0.3
-        # Wrists converging inward (narrow gap = grabbing)
-        wrists_close = abs(l_wr[0] - r_wr[0]) < body_w * 1.2
-        if l_at_neck and r_at_neck and wrists_close:
-            return "choking_posture"
+    if len(hist) >= 3:
+        wrist_speed = max(_speed(hist, rel(KP_L_WR), scale), _speed(hist, rel(KP_R_WR), scale))
+        limb_ids = (KP_L_WR, KP_R_WR, KP_L_EL, KP_R_EL, KP_L_ANK, KP_R_ANK, KP_L_KN, KP_R_KN)
+        limb_speed = float(np.mean([_speed(hist, rel(i), scale) for i in limb_ids]))
+        ankle_speed = max(_speed(hist, rel(KP_L_ANK), scale), _speed(hist, rel(KP_R_ANK), scale))
+        # a box clipped by the frame edge grows as the person enters; track the shoulders instead
+        body_speed = _speed(hist, shoulders if truncated else box_center, scale)
+    else:
+        wrist_speed = limb_speed = ankle_speed = body_speed = 0.0
 
-    # ── 4. Fighting (high-velocity + aggressive upper body) ─────────
-    wrist_vel_max = max(v_l_wr, v_r_wr)
-    if wrist_vel_max > 18 and v_overall > 8:
+    # 3. Fighting: fast arm movement relative to the body, not explained by locomotion
+    if whole_body and wrist_speed > FIGHT_WRIST_SPEED and limb_speed > FIGHT_LIMB_SPEED and body_speed < RUN_SPEED:
         return "fighting"
 
-    # ── 5. Punching / Striking ─────────────────────────────────────
-    # Fast wrist + nearly straight arm extended forward or sideways
-    def _is_punch(sh, el, wr, wrist_vel):
-        if not (sh and el and wr):
-            return False
-        arm_angle = _angle(sh, el, wr)
-        wrist_far = abs(wr[0] - sh[0]) > body_w * 0.8
-        return arm_angle > 145 and wrist_vel > 10 and wrist_far
+    # 4. Kicking: an ankle raised to hip height and moving fast
+    if whole_body and mid_hip is not None:
+        for ank in (l_ank, r_ank):
+            if ank is not None and ank[1] < mid_hip[1] and ankle_speed > KICK_ANKLE_SPEED:
+                return "kicking"
 
-    if _is_punch(l_sh, l_el, l_wr, v_l_wr):
-        return "punching"
-    if _is_punch(r_sh, r_el, r_wr, v_r_wr):
-        return "punching"
+    # 5. Locomotion
+    if body_speed > RUN_SPEED:
+        return "running"
 
-    # ── 6. Kicking ─────────────────────────────────────────────────
-    # Ankle or knee raised above hip level with high velocity
-    def _is_kick(hip, knee, ankle, v_kn, v_ank):
-        if hip is None:
-            return False
-        if ankle and ankle[1] < hip[1] and v_ank > 10:  # ankle above hip (y inverted)
-            return True
-        if knee and knee[1] < hip[1] - 5 and v_kn > 8:
-            return True
-        return False
+    if not whole_body:
+        return "walking" if body_speed > WALK_SPEED else "standing"
 
-    if _is_kick(l_hip, l_kn, l_ank, v_l_kn, v_l_ank):
-        return "kicking"
-    if _is_kick(r_hip, r_kn, r_ank, v_r_kn, v_r_ank):
-        return "kicking"
-
-    # ── 7. Guard stance (boxing / martial arts) ─────────────────────
-    # Elbows raised ≈ shoulder height, wrists near face/chin, feet wide
-    if l_el and r_el and mid_sh:
-        elbows_up = l_el[1] < mid_sh[1] + body_w * 0.5 and r_el[1] < mid_sh[1] + body_w * 0.5
-        if elbows_up:
-            # Check wrists in front of face
-            if l_wr and r_wr and nose:
-                wrists_near_face = (l_wr[1] < nose[1] + body_w or r_wr[1] < nose[1] + body_w)
-                if wrists_near_face:
-                    return "guard_stance"
-
-    # ── 8. Struggling ──────────────────────────────────────────────
-    # General high-velocity chaotic movement across multiple joints
-    fast_joints = int(v_l_wr > 8) + int(v_r_wr > 8) + int(v_l_ank > 8) + int(v_r_ank > 8)
-    if fast_joints >= 3 or (v_overall > 12):
-        return "struggling"
-
-    # ── 9. Hands raised (both wrists above head) ───────────────────
-    if l_wr and r_wr and nose:
+    # 6. Hands raised above the head
+    if l_wr is not None and r_wr is not None and nose is not None:
         if l_wr[1] < nose[1] and r_wr[1] < nose[1]:
             return "hands_raised"
 
-    # ── 10. Waving ─────────────────────────────────────────────────
-    # One wrist above shoulder with moderate velocity (oscillation)
-    if mid_sh:
-        sh_y = mid_sh[1]
-        if l_wr and l_wr[1] < sh_y and 3 < v_l_wr < 18:
-            return "waving"
-        if r_wr and r_wr[1] < sh_y and 3 < v_r_wr < 18:
-            return "waving"
-
-    # ── 11. Arm extended (pointing, threatening, reaching) ──────────
-    def _arm_extended(sh, el, wr):
-        if not (sh and el and wr):
-            return False
-        ang = _angle(sh, el, wr)
-        dist = abs(wr[0] - sh[0])
-        return ang > 155 and dist > body_w * 1.1
-
-    if _arm_extended(l_sh, l_el, l_wr) or _arm_extended(r_sh, r_el, r_wr):
-        return "arm_extended"
-
-    # ── 12. Jumping ────────────────────────────────────────────────
-    if mid_ank and mid_hip:
-        if mid_ank[1] < mid_hip[1] and (v_l_ank + v_r_ank) > 10:
-            return "jumping"
-
-    # ── 13. Crouching ──────────────────────────────────────────────
-    def _knee_angle(hip, knee, ankle):
-        if hip and knee and ankle:
-            return _angle(hip, knee, ankle)
-        return 180
-
-    la = _knee_angle(l_hip, l_kn, l_ank)
-    ra = _knee_angle(r_hip, r_kn, r_ank)
-    if la < 120 or ra < 120:
+    # 7. Crouching: bent knees
+    angles = [_angle(h, kn, a) for h, kn, a in ((l_hip, l_kn, l_ank), (r_hip, r_kn, r_ank))
+              if h is not None and kn is not None and a is not None]
+    if angles and min(angles) < 110:
         return "crouching"
 
-    # ── 14. Bending (torso forward) ────────────────────────────────
-    if mid_sh and mid_hip:
-        dy = mid_hip[1] - mid_sh[1]
-        dx = abs(mid_hip[0] - mid_sh[0])
-        if dy > 0:
-            tilt = math.degrees(math.atan2(dx, dy))
-            if tilt > 35:
-                return "bending"
+    # 8. Bending forward
+    if torso_tilt is not None and torso_tilt > 35:
+        return "bending"
 
-    # ── 15. Running / Walking / Standing (stride width) ─────────────
-    if l_ank and r_ank and l_kn and r_kn:
-        ankle_spread = abs(l_ank[0] - r_ank[0])
-        stride = ankle_spread / body_w
-        # Also use velocity to disambiguate walk vs run
-        leg_vel = (v_l_ank + v_r_ank) / 2
-        if stride > 1.2 or leg_vel > 12:
-            return "running"
-        elif stride > 0.6 or leg_vel > 4:
-            return "walking"
-
+    if body_speed > WALK_SPEED:
+        return "walking"
     return "standing"
-
-
-# ── Main detect function ──────────────────────────────────────────
-
-def detect(frame, imgsz=640, conf=0.5):
-    """
-    Run YOLOv8-Pose on a BGR frame.
-    Returns (frame, detections) — each detection has:
-      class, confidence, box, pose_action, height_px, keypoints
-    """
-    results = model(frame, imgsz=imgsz, conf=conf, device=DEVICE, classes=[0])
-    r = results[0]
-    detections = []
-
-    boxes = getattr(r, "boxes", None)
-    kpts_data = getattr(r, "keypoints", None)
-    if boxes is None:
-        return frame, detections
-
-    _prune_history()
-
-    for i, box in enumerate(boxes):
-        xyxy = [float(v) for v in box.xyxy[0].tolist()]
-        x1, y1, x2, y2 = xyxy
-        conf_score = float(box.conf[0].item())
-        cls_name = r.names[int(box.cls[0].item())] if hasattr(r, "names") else "person"
-
-        pose_action = "unknown"
-        kpts_list = []
-
-        if kpts_data is not None and i < len(kpts_data):
-            kpts_np = kpts_data[i].data[0].cpu().numpy()  # (17,3)
-            kpts_list = kpts_np.tolist()
-            # Push to motion history and get velocities
-            vel = _push_history(xyxy, kpts_np)
-            pose_action = _classify_pose(kpts_np, vel)
-
-        detections.append({
-            "class": cls_name,
-            "confidence": conf_score,
-            "box": xyxy,
-            "pose_action": pose_action,
-            "height_px": round(abs(y2 - y1), 1),
-            "keypoints": kpts_list if kpts_list else None,
-        })
-
-    return frame, detections

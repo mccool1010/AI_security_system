@@ -395,7 +395,8 @@ class CameraCalibrator:
             [0, fy, cy],
             [0,  0,  1],
         ], dtype=np.float64)
-        self._dist_coeffs = np.array([[0.05, -0.08, 0.0, 0.0, 0.02]], dtype=np.float64)
+        # Unknown lens: assume no distortion rather than "correcting" with invented coefficients.
+        self._dist_coeffs = np.zeros((1, 5), dtype=np.float64)
         self._fov_h_deg = fov_h
         self._fov_v_deg = 2.0 * math.degrees(math.atan(h / (2.0 * fy)))
         self._resolution = (w, h)

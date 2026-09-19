@@ -1,13 +1,19 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import { useBackendStatus } from "../hooks/useLiveData.js";
+
+// Events written before pipeline 2.0 stored {name: "unknown", score: 0} when no face was visible.
+const realFaces = (ev) => (ev?.faces || []).filter((f) => !(f.name === "unknown" && !f.score));
 
 export default function EventsPage() {
   const [events, setEvents] = useState([]);
   const [status, setStatus] = useState(null);
+  const { perf } = useBackendStatus(10000);
 
   useEffect(() => {
     const fetchEvents = async () => {
       try {
-        const res = await fetch("/events");
+        const res = await fetch("/api/events?limit=100");
         const data = await res.json();
         setEvents(data);
       } catch (err) {
@@ -22,7 +28,7 @@ export default function EventsPage() {
   useEffect(() => {
     const fetchStatus = async () => {
       try {
-        const res = await fetch("/status");
+        const res = await fetch("/api/status");
         const data = await res.json();
         setStatus(data);
       } catch (err) {
@@ -48,18 +54,21 @@ export default function EventsPage() {
 
   const buildDescription = (ev) => {
     const parts = [];
-    const face = ev?.faces?.[0];
-    const det = ev?.detections?.[0];
-    const personName = face?.name && face.name !== "unknown" ? face.name : null;
-
-    if (personName) {
-      parts.push(`Recognized: ${personName} (${(face.score * 100).toFixed(1)}%)`);
-    } else if (det) {
-      parts.push(`Unknown person (${(det.confidence * 100).toFixed(1)}% conf)`);
+    const faces = realFaces(ev);
+    for (const f of faces) {
+      parts.push(f.name !== "unknown"
+        ? `Recognized: ${f.name} (${(f.score * 100).toFixed(0)}% similarity)`
+        : "Unrecognised face");
     }
+    if (!faces.length && ev.face_status === "no_face_visible") parts.push("Face not visible");
+    if (ev.trigger && ev.trigger !== "activity") parts.push(`Trigger: ${ev.trigger.replace(/_/g, " ")}`);
 
     if (ev.action) parts.push(ev.action);
-    if (ev.height_m) parts.push(`Height: ${ev.height_m}m`);
+    if (ev.height_m) {
+      const spread = ev.height_spread_m != null ? ` ±${Math.round(ev.height_spread_m * 100)} cm` : "";
+      parts.push(`Height: ${Number(ev.height_m).toFixed(2)} m${spread}`);
+    }
+    for (const r of ev.risk_reasons || []) parts.push(r);
     return parts;
   };
 
@@ -82,24 +91,31 @@ export default function EventsPage() {
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {events.map((ev, i) => {
-              const face = ev?.faces?.[0];
+              const known = realFaces(ev).filter((f) => f.name !== "unknown").map((f) => f.name);
+              const count = ev?.persons?.length ?? ev?.detections?.length ?? 0;
+              const label = known.length ? known.join(", ") : count > 1 ? `${count} people` : "Person";
               const det = ev?.detections?.[0];
-              const personName = face?.name && face.name !== "unknown" ? face.name : null;
-              const label = personName || det?.class || "Unknown";
-              const conf = personName && face?.score != null
-                ? (face.score * 100).toFixed(1) + "%"
-                : det?.confidence != null
-                  ? (det.confidence * 100).toFixed(1) + "%"
-                  : "";
+              const conf = det?.confidence != null ? `detection ${(det.confidence * 100).toFixed(0)}%` : "";
               const descLines = buildDescription(ev);
 
               return (
-                <div key={i} className="card" style={{ display: "flex", gap: 12, padding: 14 }}>
+                <div key={`${ev.source}-${ev.unix_ts ?? i}`} className="card" style={{ display: "flex", gap: 12, padding: 14 }}>
                   {/* Screenshot */}
-                  {ev.screenshot_path ? (
+                  {ev.clip_status === "ready" && ev.clip_path ? (
+                    <video
+                      className="event-clip"
+                      src={`/api/clips/${ev.source}/${ev.clip_path}`}
+                      poster={ev.screenshot_path ? `/api/screenshots/${ev.screenshot_path}` : undefined}
+                      controls
+                      preload="none"
+                      muted
+                      playsInline
+                    />
+                  ) : ev.screenshot_path ? (
                     <img
                       src={`/api/screenshots/${ev.screenshot_path}`}
                       alt="event"
+                      title={ev.clip_status === "recording" ? "clip still recording" : undefined}
                       style={{
                         width: 80, height: 56, objectFit: "cover",
                         borderRadius: 8, flexShrink: 0,
@@ -201,16 +217,16 @@ export default function EventsPage() {
           </div>
           <div className="card-body" style={{ padding: "10px 16px" }}>
             {[
-              { name: "Object Detection", value: "YOLOv8-Pose" },
-              { name: "Activity AI", value: "SlowFast R50" },
-              { name: "Face Recognition", value: "DeepFace" },
-              { name: "Tracking", value: "IoU Tracker" },
-              { name: "Risk Scoring", value: "Hybrid Engine" },
-              { name: "Height", value: "Auto-calibrated" },
-            ].map((item, i) => (
-              <div key={i} className="status-row">
+              { name: "Compute", value: perf ? (perf.device === "cuda" ? "GPU" : "CPU") : "—", ok: !!perf },
+              { name: "Pose", value: "YOLOv8n-Pose", ok: !!perf },
+              { name: "Activity AI", value: perf?.activity?.ready ? "SlowFast R50" : perf?.activity?.enabled === false ? "Disabled" : "Loading…", ok: perf?.activity?.ready },
+              { name: "Faces", value: perf?.face?.available ? perf.face.backend : "Disabled", ok: perf?.face?.available },
+              { name: "Depth", value: perf?.depth?.ready ? "MiDaS (relative)" : "Off", ok: perf?.depth?.ready },
+              { name: "Tracking", value: "IoU + distance", ok: !!perf },
+            ].map((item) => (
+              <div key={item.name} className="status-row">
                 <span className="status-label">{item.name}</span>
-                <span className="status-value" style={{ color: "var(--success)", fontSize: 11 }}>
+                <span className="status-value" style={{ color: item.ok ? "var(--success)" : "var(--text-muted)", fontSize: 11 }}>
                   {item.value}
                 </span>
               </div>
@@ -219,13 +235,13 @@ export default function EventsPage() {
         </div>
 
         {/* Quick link */}
-        <a
-          href="/settings"
+        <Link
+          to="/settings"
           className="btn-secondary"
           style={{ justifyContent: "center", textDecoration: "none" }}
         >
           ⚙ Settings
-        </a>
+        </Link>
       </div>
     </div>
   );

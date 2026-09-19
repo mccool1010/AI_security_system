@@ -28,16 +28,19 @@ ChartJS.register(
 export default function MetricsPage() {
   const [stats, setStats] = useState({ events_last_hour: 0, events_today: 0 });
   const [metrics, setMetrics] = useState(null);
+  const [perf, setPerf] = useState(null);
 
   useEffect(() => {
     const fetchAll = async () => {
       try {
-        const [sRes, mRes] = await Promise.all([
-          fetch("/stats"),
+        const [sRes, mRes, pRes] = await Promise.all([
+          fetch("/api/stats"),
           fetch("/api/metrics"),
+          fetch("/api/perf"),
         ]);
-        setStats(await sRes.json());
-        setMetrics(await mRes.json());
+        if (sRes.ok) setStats(await sRes.json());
+        if (mRes.ok) setMetrics(await mRes.json());
+        if (pRes.ok) setPerf(await pRes.json());
       } catch (err) {
         console.error("Metrics fetch error", err);
       }
@@ -70,7 +73,7 @@ export default function MetricsPage() {
   // ── Chart data ─────────────────────────────────────
   const eventsLineData = metrics
     ? {
-      labels: metrics.events_by_hour.map((b) => `${b.hour}h ago` === "0h ago" ? "now" : `-${24 - b.hour}h`),
+      labels: metrics.events_by_hour.map((b) => `-${24 - b.hour}h`),
       datasets: [
         {
           label: "Events",
@@ -91,7 +94,7 @@ export default function MetricsPage() {
       datasets: [
         {
           data: metrics.detection_distribution.map((d) => d.count),
-          backgroundColor: ["#34d399", "#60a5fa", "#fbbf24", "#f87171"],
+          backgroundColor: ["#34d399", "#60a5fa", "#fbbf24", "#f87171", "#a78bfa", "#f472b6", "#22d3ee", "#94a3b8"],
           borderWidth: 0,
         },
       ],
@@ -159,12 +162,20 @@ export default function MetricsPage() {
           </div>
         </div>
         <div className={card}>
-          <div className="text-xs text-gray-400 mb-1">Face Match Rate</div>
+          <div className="text-xs text-gray-400 mb-1" title={metrics?.face_match_rate_note}>
+            Faces matched (24h)
+          </div>
           <div className="text-2xl font-bold text-emerald-400">
-            {metrics?.face_match_rate ?? 0}%
+            {metrics?.face_observations ? `${metrics.face_match_rate}%` : "—"}
+          </div>
+          <div className="text-[10px] text-gray-500">
+            {metrics?.face_observations ?? 0} visible faces · not an accuracy figure
           </div>
         </div>
       </div>
+
+      {/* ── Measured performance ───────────── */}
+      {perf && <PerfPanel perf={perf} card={card} />}
 
       {/* ── Charts Grid ────────────────────── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -185,7 +196,7 @@ export default function MetricsPage() {
         {/* Detection distribution */}
         <div className={card}>
           <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wider mb-3">
-            🧠 Action Distribution
+            🧠 Event Triggers
           </h3>
           <div style={{ height: 220 }}>
             {actionDoughnutData ? (
@@ -223,6 +234,68 @@ export default function MetricsPage() {
             )}
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function ms(v) {
+  return v == null ? "—" : `${v.toFixed(v < 10 ? 1 : 0)} ms`;
+}
+
+function PerfPanel({ perf, card }) {
+  const cams = Object.entries(perf.cameras || {});
+  const models = [
+    ["Pose (YOLOv8n)", perf.device, true],
+    ["Activity (SlowFast)", perf.activity?.device, perf.activity?.ready, perf.activity?.last_inference_ms],
+    ["Depth (MiDaS)", perf.depth?.device, perf.depth?.ready, perf.depth?.last_inference_ms],
+    ["Faces", perf.face?.backend, perf.face?.available],
+  ];
+  return (
+    <div className={card}>
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">⚙ Measured performance</h3>
+        <span className="text-xs text-gray-500">
+          {perf.device === "cuda" ? `GPU · ${perf.gpu}` : "CPU"} · torch {perf.torch}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <table className="kv-table">
+          <thead>
+            <tr className="text-gray-500">
+              <td>Camera</td><td>Capture</td><td>Processed</td><td>Frame → result (p50 / p95)</td>
+            </tr>
+          </thead>
+          <tbody>
+            {cams.map(([id, c]) => (
+              <tr key={id}>
+                <td>{id}</td>
+                <td>{c.capture_fps ?? "—"} fps</td>
+                <td>{c.pipeline_fps ?? "—"} fps</td>
+                <td>{ms(c.latency?.frame_to_result?.p50_ms)} / {ms(c.latency?.frame_to_result?.p95_ms)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <table className="kv-table">
+          <tbody>
+            {models.map(([name, dev, ready, last]) => (
+              <tr key={name}>
+                <td>{name}</td>
+                <td>
+                  {ready ? (dev || "on") : "off"}
+                  {last != null ? ` · ${ms(last)}` : ""}
+                </td>
+              </tr>
+            ))}
+            {cams[0] && Object.entries(cams[0][1].stages || {}).filter(([, v]) => v).map(([k, v]) => (
+              <tr key={k}>
+                <td className="text-gray-500">stage: {k}</td>
+                <td>{ms(v.mean_ms)} mean</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   );

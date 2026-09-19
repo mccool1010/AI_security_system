@@ -1,7 +1,18 @@
 import { Link, useLocation } from "react-router-dom";
+import { DEMO_MODE } from "../config.js";
+import { useBackendStatus } from "../hooks/useLiveData.js";
 
 export default function DashboardLayout({ children }) {
   const location = useLocation();
+  const { online, mongo, perf } = useBackendStatus();
+  const statusText = DEMO_MODE ? "Demo data"
+    : online === null ? "Connecting…"
+      : !online ? "Backend offline"
+        : mongo === false ? "Database offline"
+          : "System online";
+  const dotColor = DEMO_MODE ? "var(--warning)"
+    : online && mongo !== false ? "var(--success)"
+      : online === null ? "var(--text-muted)" : "var(--danger)";
   const navItems = [
     { to: "/dashboard", label: "Dashboard", icon: "⬡" },
     { to: "/cameras", label: "Cameras", icon: "◉" },
@@ -41,7 +52,7 @@ export default function DashboardLayout({ children }) {
           })}
         </nav>
 
-        {/* System status footer */}
+        {/* System status footer — reflects the real backend */}
         <div style={{
           padding: "14px 16px",
           borderTop: "1px solid var(--border-subtle)",
@@ -51,12 +62,20 @@ export default function DashboardLayout({ children }) {
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
             <span style={{
               width: 6, height: 6, borderRadius: "50%",
-              background: "var(--success)",
-              boxShadow: "0 0 6px rgba(16,185,129,0.5)",
+              background: dotColor,
+              boxShadow: `0 0 6px ${dotColor}`,
             }} />
-            <span style={{ color: "var(--text-secondary)", fontWeight: 500 }}>System Online</span>
+            <span style={{ color: "var(--text-secondary)", fontWeight: 500 }}>{statusText}</span>
           </div>
-          <div>YOLOv8-Pose + SlowFast R50</div>
+          {perf && (
+            <div>
+              {perf.device === "cuda" ? `GPU · ${perf.gpu}` : "CPU"}
+              {perf.pipeline_fps ? ` · ${perf.pipeline_fps} fps` : ""}
+            </div>
+          )}
+          {perf?.face && !perf.face.available && (
+            <div style={{ color: "var(--warning)" }}>Face recognition off</div>
+          )}
         </div>
       </aside>
 
@@ -67,6 +86,11 @@ export default function DashboardLayout({ children }) {
         padding: "20px 24px",
         background: "var(--bg-primary)",
       }}>
+        {DEMO_MODE && (
+          <div className="demo-banner">
+            Demo mode — simulated data, no backend connected
+          </div>
+        )}
         {children}
       </main>
     </div>

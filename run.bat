@@ -17,7 +17,7 @@ docker info >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo         Docker is not running! Please open Docker Desktop.
     echo         Trying to continue without Docker MongoDB...
-    echo         (Make sure MongoDB is running some other way)
+    echo         Make sure MongoDB is running some other way.
 ) else (
     docker compose up -d mongodb >nul 2>&1
     echo         MongoDB started
@@ -27,11 +27,16 @@ if %ERRORLEVEL% NEQ 0 (
 echo  [2/3] Starting backend server...
 cd /d "%~dp0backend"
 
-start "SecureVision Backend" cmd /k "title SecureVision Backend && color 0E && python app.py"
+if not exist "venv\Scripts\python.exe" (
+    echo         backend\venv not found - run install.bat first.
+    pause
+    exit /b 1
+)
+start "SecureVision Backend" cmd /k "title SecureVision Backend && color 0E && venv\Scripts\python.exe app.py"
 
 :: Give backend a moment to boot
 echo         Waiting for backend to initialize...
-timeout /t 4 /nobreak >nul
+timeout /t 8 /nobreak >nul
 
 :: ── Start Dashboard (Vite dev server) ───────────────────────
 echo  [3/3] Starting dashboard...

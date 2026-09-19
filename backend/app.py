@@ -1,1074 +1,583 @@
-# app.py
-from flask import Flask, Response, jsonify
-from flask_cors import CORS
-import cv2
-import time
-import signal
-import threading
-import os
-import detector
-import height_estimator
-from action_recognizer import ActionRecognizer
-from camera_calibrator import CameraCalibrator, list_presets as list_camera_presets
-from depth_estimator import DepthEstimator
-import image_quality
-from datetime import datetime
-from pymongo import MongoClient
-from flask import request
+"""SecureVision backend: Flask API + per-camera ML pipelines.
+
+Environment:
+  MONGO_URI, MONGO_DB          database (default mongodb://localhost:27017/, security_system)
+  CAMERA_SOURCE                default camera: device index or URL (default 0)
+  DEMO_MODE, DEMO_VIDEO        loop a video file instead of the default camera
+  FACE_BACKEND                 facenet (default) | deepface | none
+  ENABLE_ACTIVITY              1 (default) | 0   SlowFast activity recognition
+  ENABLE_DEPTH                 0 (default) | 1   MiDaS relative depth
+  ENABLE_CLIPS                 1 (default) | 0   record a short video per event
+  OVERLAYS                     1 (default) | 0   draw boxes/skeletons on the stream
+  DASHBOARD_PASSWORD           dashboard password (generated on first run if unset)
+  AUTH_DISABLED                1 disables the password gate entirely
+  PORT                         default 5000
+"""
 import base64
-import uuid
+import os
+import queue
+import signal
+import sys
+import threading
+import time
+
+# Log lines contain non-ASCII symbols; never let a legacy console encoding crash a thread.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+from collections import Counter
+from datetime import datetime, timezone
+
+import cv2
 import numpy as np
-import cv2 as cv2_local
-from face_utils import get_faces_and_embeddings, cosine_similarity, compute_blur_score, compute_brightness
+from flask import Flask, Response, jsonify, request, send_from_directory
+from flask_cors import CORS
+from pymongo import DESCENDING, MongoClient
+
+import clips
+import detector
+import face_utils
+from action_recognizer import ActionRecognizer
+from auth import Auth
+from camera_calibrator import CameraCalibrator, list_presets as list_camera_presets
+from demo_video import DEMO_MODE, get_demo_camera
+from depth_estimator import DepthEstimator
+from event_bus import EventBus
+from identity import IdentityStore
+from pipeline import PIPELINE_VERSION, CameraPipeline, FaceWorker, Settings
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SCREENSHOT_DIR = os.path.join(BASE_DIR, "static", "screenshots")
+CLIP_DIR = os.path.join(BASE_DIR, "static", "clips")
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+os.makedirs(CLIP_DIR, exist_ok=True)
+
+
+def _flag(name, default):
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, supports_credentials=True)
+auth = Auth().install(app)
 
-# ---------- MongoDB setup ----------
-# Use a local MongoDB server. If you run `mongod` locally the default host/port is fine.
-# If you're using a custom host/port, replace the URI below.
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
-client = MongoClient(MONGO_URI)
-db = client["security_system"]
+# ── Database ───────────────────────────────────────────────────────
+client = MongoClient(os.environ.get("MONGO_URI", "mongodb://localhost:27017/"), serverSelectionTimeoutMS=5000)
+db = client[os.environ.get("MONGO_DB", "security_system")]
 events_collection = db["events"]
 users_collection = db["users"]
-# create an index on timestamp to help queries (optional)
-events_collection.create_index("timestamp")
-# in-memory cache of user embeddings to avoid scanning DB each frame
-cached_users = []
-# ---- Event session tracking ----
-current_event = None
-event_start_time = None
-last_seen_time = None
-event_detections = []
-# Auto-calibrated height scale: metres_per_pixel
-reference_scale = {
-    "meters_per_pixel": None,
-    "reference_height_m": None,
-    "reference_pixels": None,
-}
-AVG_PERSON_HEIGHT_M = 1.7  # default assumption for auto-calibration
+cameras_collection = db["cameras"]
+try:
+    events_collection.create_index([("unix_ts", DESCENDING)])
+    users_collection.create_index("name")
+except Exception as e:
+    print(f"⚠ MongoDB not reachable at startup ({e}); events will not be stored until it is.", flush=True)
 
-# ── SlowFast action recognizer (Kinetics-400) ────
-activity_recognizer = ActionRecognizer()
 
-# ── Camera calibrator & depth estimator ────
-# Per-camera calibrators stored in dict; default local camera uses "cam_local"
-camera_calibrators: dict[str, CameraCalibrator] = {}
+# ── Shared context ─────────────────────────────────────────────────
+class AppContext:
+    def __init__(self):
+        self.settings = Settings()
+        self.bus = EventBus()
+        self.events = events_collection
+        self.screenshot_dir = SCREENSHOT_DIR
+        self.clip_dir = CLIP_DIR
+        self.clips_enabled = _flag("ENABLE_CLIPS", "1")
+        self.face_backend = face_utils.BACKEND_ID
+        self.faces_enabled = face_utils.is_available()
+        self.identity = IdentityStore(users_collection, face_utils.BACKEND_ID)
+        self.identity.reload()
+        self.faces = FaceWorker(face_utils, self.identity)
+        self.action = ActionRecognizer(enabled=_flag("ENABLE_ACTIVITY", "1"))
+        self.depth = DepthEstimator(enabled=_flag("ENABLE_DEPTH", "0"))
 
-def get_calibrator(cam_id: str = "cam_local") -> CameraCalibrator:
-    """Get or create a CameraCalibrator for a given camera ID."""
-    if cam_id not in camera_calibrators:
-        camera_calibrators[cam_id] = CameraCalibrator(cam_id)
-    return camera_calibrators[cam_id]
 
-# Initialize default calibrator
-_default_calibrator = get_calibrator("cam_local")
+ctx = AppContext()
+auth.announce()
+detector.warmup()
+for _cam in os.listdir(CLIP_DIR):
+    clips.prune(os.path.join(CLIP_DIR, _cam))
+calibrators = {}
+pipelines = {}                 # cam_id -> CameraPipeline (insertion order = display order)
+_cam_lock = threading.Lock()
+DEFAULT_CAM = "cam_local"
 
-# Depth estimator (shared across all cameras — single MiDaS model)
-# Uses MiDaS_small by default for faster inference; change to "DPT_Large" for best accuracy
-depth_est = DepthEstimator(model_type="MiDaS_small")
 
-def load_users_cache():
-    global cached_users
-    cached_users = []
-    try:
-        for u in users_collection.find({}):
-            emb = u.get("embedding")
-            if emb:
-                cached_users.append({
-                    "user_id": u.get("user_id") or str(u.get("_id")),
-                    "name": u.get("name"),
-                    "embedding": emb,
-                    "embeddings": u.get("embeddings", []),  # multi-embedding support
-                })
-        print(f"✓ Loaded {len(cached_users)} users: {[u['name'] for u in cached_users]}", flush=True)
-    except Exception as e:
-        print("Failed to load users cache:", e, flush=True)
+def get_calibrator(cam_id):
+    if cam_id not in calibrators:
+        calibrators[cam_id] = CameraCalibrator(cam_id)
+    return calibrators[cam_id]
 
-# initial cache load
-load_users_cache()
 
-# ---------- Camera & detection setup ----------
-from demo_video import DEMO_MODE, get_demo_camera
+def open_source(source):
+    if source == "__demo__":
+        return get_demo_camera()
+    cap = cv2.VideoCapture(source)
+    if isinstance(source, int):
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    else:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def parse_source(value):
+    value = str(value).strip()
+    return int(value) if value.isdigit() else value
+
+
+def add_pipeline(cam_id, name, source, cam_type):
+    p = CameraPipeline(cam_id, name, source, cam_type, open_source, ctx)
+    with _cam_lock:
+        pipelines[cam_id] = p
+    p.start()
+    print(f"📷 Camera '{name}' ({cam_id}) started, source={source}", flush=True)
+    return p
+
+
+def get_pipeline(cam_id=None):
+    return pipelines.get(cam_id or DEFAULT_CAM)
+
 
 if DEMO_MODE:
-    print("🎬 DEMO MODE — Using sample video instead of live camera", flush=True)
+    print("🎬 DEMO MODE — looping a video file instead of the camera", flush=True)
+    add_pipeline(DEFAULT_CAM, "Demo Video", "__demo__", "demo")
+else:
+    add_pipeline(DEFAULT_CAM, "Local Camera", parse_source(os.environ.get("CAMERA_SOURCE", "0")), "local")
 
-def get_camera():
-    if DEMO_MODE:
-        return get_demo_camera()
-    cam = cv2.VideoCapture(0)
-    cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    return cam
-
-camera = get_camera()
-background = None
-
-motion_counter = 0
-motion_threshold = 5
-alert_cooldown = 0
-
-# Detection filtering
-CONSECUTIVE_REQUIRED = 2
-CONF_THRESHOLD = 0.6
-consecutive_detections = 0
-# allow runtime tuning via endpoints (will update these globals)
-# motion_threshold and alert_cooldown are already declared earlier
-
-# allow pausing the camera loop so external consumers (browser) can use the device
-camera_paused = False
-
-activity_state = {
-    "active": False,
-    "last_event": None,
-    "last_detections": [],
-    "active_until": None,
-    "current_session": None,
-    "risk_level": "LOW",
-}
-
-SESSION_TIMEOUT = 5
-
-# ── Screenshots ──────────────────────────────────────
-SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "static", "screenshots")
-os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+try:
+    for c in cameras_collection.find({}):
+        add_pipeline(c["cam_id"], c["name"], parse_source(c["source"]), c.get("type", "ip"))
+except Exception as e:
+    print(f"⚠ Could not restore saved cameras: {e}", flush=True)
 
 
-# ── Frame overlay helper ─────────────────────────────
-def _estimate_height_new(det, frame_shape, frame=None, cam_id="cam_local"):
-    """Estimate height using the full precision pipeline."""
-    kpts = det.get("keypoints")
-    box = det.get("box", [])
-    if len(box) < 4:
+def _json_error(msg, code=400, **extra):
+    return jsonify({"error": msg, **extra}), code
+
+
+def _decode_image(b64):
+    if not b64:
         return None
-    kpts_np = np.array(kpts) if kpts else None
-    calibrator = get_calibrator(cam_id)
-    # Auto-calibrate camera from frame shape if not yet calibrated
-    if not calibrator.is_calibrated and frame is not None:
-        calibrator.auto_calibrate_from_frame(frame.shape)
-    result = height_estimator.estimate_height(
-        kpts_np, box, frame_shape,
-        pose_action=det.get("pose_action"),
-        camera_calibrator=calibrator,
-        depth_estimator=depth_est,
-        quality_analyzer=image_quality,
-        frame=frame,
-    )
-    return result
+    if "," in b64:
+        b64 = b64.split(",", 1)[1]
+    arr = np.frombuffer(base64.b64decode(b64), np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-def _auto_calibrate_new(det, frame_shape):
-    """Auto-calibrate height estimator on first standing person."""
-    if height_estimator.is_calibrated():
-        return
-    if det.get("pose_action") == "standing":
-        kpts = det.get("keypoints")
-        box = det.get("box", [])
-        if len(box) < 4:
-            return
-        kpts_np = np.array(kpts) if kpts else None
-        height_estimator.auto_calibrate(
-            kpts_np, box, frame_shape,
-            known_height_m=AVG_PERSON_HEIGHT_M
-        )
-
-
-def draw_overlays(frame, detections, ref_scale, faces=None, risk_level=None, slowfast_actions=None):
-    """
-    No-op: overlays are now rendered in the frontend side panel.
-    Returns the raw frame untouched for maximum FPS.
-    """
-    return frame
-
-# ── Person Tracker (per-camera) ──────────────────────
-# Tracks persons across frames using bounding box IoU
-# Key: camera_id -> { person_idx: { first_seen, last_seen, box, action } }
-person_trackers = {}
-
-def _iou(boxA, boxB):
-    """Compute IoU between two [x1,y1,x2,y2] boxes."""
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-    inter = max(0, xB - xA) * max(0, yB - yA)
-    areaA = max(1, (boxA[2]-boxA[0]) * (boxA[3]-boxA[1]))
-    areaB = max(1, (boxB[2]-boxB[0]) * (boxB[3]-boxB[1]))
-    return inter / (areaA + areaB - inter)
-
-def _update_tracker(cam_id, detections, now):
-    """Update person tracker for a camera. Returns action classifications."""
-    if cam_id not in person_trackers:
-        person_trackers[cam_id] = {}
-    tracker = person_trackers[cam_id]
-
-    # Match current detections to tracked persons via IoU
-    used = set()
-    actions = []
-    for det in detections:
-        if det.get("class") != "person":
-            continue
-        box = det.get("box", [])
-        if len(box) < 4:
-            continue
-        best_id, best_iou = None, 0.3  # minimum IoU threshold
-        for pid, p in tracker.items():
-            if pid in used:
-                continue
-            iou = _iou(box, p["box"])
-            if iou > best_iou:
-                best_id, best_iou = pid, iou
-        if best_id is not None:
-            # Update existing person
-            tracker[best_id]["last_seen"] = now
-            tracker[best_id]["box"] = box
-            used.add(best_id)
-        else:
-            # New person
-            best_id = str(uuid.uuid4())[:8]
-            tracker[best_id] = {
-                "first_seen": now, "last_seen": now, "box": box
-            }
-            used.add(best_id)
-        # Classify action based on duration
-        duration = now - tracker[best_id]["first_seen"]
-        if duration < 5:
-            action = "passing"
-        elif duration < 15:
-            action = "visitor"
-        elif duration < 60:
-            action = "lingering"
-        else:
-            action = "loitering"
-        tracker[best_id]["action"] = action
-        actions.append(action)
-
-    # Expire stale persons (not seen for 5s)
-    stale = [pid for pid, p in tracker.items() if now - p["last_seen"] > 5]
-    for pid in stale:
-        del tracker[pid]
-
-    return actions
-
-
-def _compute_risk(faces, actions):
-    """Compute risk score and level from face results + actions."""
-    score = 0
-    # Face signals
-    if faces:
-        all_unknown = True
-        for f in faces:
-            if f.get("name") and f["name"] != "unknown" and f.get("user_id"):
-                all_unknown = False  # known person = no penalty
-        if all_unknown:
-            score += 1  # unknown person = mild risk
-    else:
-        score += 1  # no face detected = mild risk
-    # Action signals — only high-risk temporal behaviors
-    if actions:
-        worst = actions[0] if len(actions) == 1 else (
-            "loitering" if "loitering" in actions else
-            "lingering" if "lingering" in actions else
-            "visitor" if "visitor" in actions else "passing"
-        )
-        if worst == "loitering":
-            score += 3  # loitering 60s+ is genuinely suspicious
-        elif worst == "lingering":
-            score += 1  # lingering 15s is normal, slight bump
-    # Risk level (more conservative thresholds)
-    if score >= 4:
-        level = "HIGH"
-    elif score >= 2:
-        level = "MEDIUM"
-    else:
-        level = "LOW"
-    return score, level
+# =====================================================================
+#  Health / system
+# =====================================================================
 
 @app.get("/health")
+@app.get("/api/health")
 def health():
     return {"status": "ok", "demo_mode": DEMO_MODE}
 
-@app.get("/api/system/info")
-def system_info():
-    """System info for the landing/portfolio page."""
-    return jsonify({
-        "demo_mode": DEMO_MODE,
-        "models": {
-            "pose": "YOLOv8n-Pose (COCO 17-keypoint)",
-            "activity": "SlowFast R50 (Kinetics-400)",
-            "depth": "MiDaS v3.1",
-            "face": "ArcFace (DeepFace)",
-        },
-        "features": [
-            "Real-time pose estimation & action recognition",
-            "Precision height measurement (±3-5cm)",
-            "Monocular depth estimation",
-            "Face recognition & enrollment",
-            "Multi-camera support (USB/IP/RTSP)",
-            "Per-person Kalman-filtered tracking",
-            "Camera lens distortion correction",
-            "Image quality-gated confidence scoring",
-            "Risk level assessment",
-        ],
-    })
-
-@app.get("/activity_status")
-def activity_status():
-    return jsonify(activity_state)
-
-# ── Shared state between streaming loop and ML worker ──────────
-_latest_frame = None          # raw BGR frame from camera, updated every read
-_latest_frame_lock = threading.Lock()
-_cached_overlay_data = {      # ML results cached for API + overlay
-    "detections": [],
-    "risk_level": "LOW",
-    "sf_actions": [],
-    "height_data": [],           # per-person height/distance/visibility
-}
-
-def _ml_worker():
-    """
-    Background thread: runs YOLO, motion detection, face matching, event
-    generation, etc.  Reads _latest_frame, writes _cached_overlay_data.
-    This frees the streaming loop to run at camera-native FPS (~30).
-    """
-    global camera, background, motion_counter, alert_cooldown, activity_state
-    global consecutive_detections
-
-    local_bg = None
-    print("🧠 ML worker thread started", flush=True)
-
-    while True:
-        # Grab the latest raw frame
-        with _latest_frame_lock:
-            raw = _latest_frame
-        if raw is None:
-            time.sleep(0.01)
-            continue
-
-        frame = raw.copy()
-
-        # ── Motion detection ──
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (21, 21), 0)
-
-        if local_bg is None:
-            local_bg = gray.copy().astype("float")
-            background = local_bg
-            time.sleep(0.01)
-            continue
-
-        frame_delta = cv2.absdiff(cv2.convertScaleAbs(local_bg), gray)
-        _, thresh = cv2.threshold(frame_delta, 35, 255, cv2.THRESH_BINARY)
-        thresh = cv2.dilate(thresh, None, iterations=2)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        motion = any(cv2.contourArea(c) > 4000 for c in contours)
-        motion_counter = motion_counter + 1 if motion else max(0, motion_counter - 1)
-        cv2.accumulateWeighted(gray, local_bg, 0.1)
-        background = local_bg
-
-        # ── YOLO-Pose detection (~88ms — the expensive part) ──
-        _, detections = detector.detect(frame, conf=CONF_THRESHOLD)
-
-        detections = [
-            {
-                "class": d.get("class"),
-                "confidence": float(d.get("confidence", 0.0)),
-                "box": [float(v) for v in d.get("box", [])],
-                "pose_action": d.get("pose_action", "unknown"),
-                "height_px": d.get("height_px", 0),
-                "keypoints": d.get("keypoints"),
-            }
-            for d in detections
-            if float(d.get("confidence", 0.0)) >= CONF_THRESHOLD and d.get("class") == "person"
-        ]
-
-        for d in detections:
-            _auto_calibrate_new(d, frame.shape)
-
-        # Push to SlowFast buffer and depth estimator
-        activity_recognizer.push_frame(frame)
-        depth_est.push_frame(frame)
-
-        # Get SlowFast actions (returns cached, non-blocking)
-        sf_actions = activity_recognizer.get_actions()
-        risk_lvl = activity_state.get("risk_level", "LOW")
-
-        # Compute height/distance for each person (for API)
-        height_data = []
-        for d in detections:
-            try:
-                h_res = _estimate_height_new(d, frame.shape, frame=frame, cam_id="cam_local")
-                if h_res:
-                    height_data.append(h_res)
-                else:
-                    height_data.append({})
-            except Exception:
-                height_data.append({})
-
-        # Update cached overlay data for streaming loop + API
-        _cached_overlay_data["detections"] = detections
-        _cached_overlay_data["risk_level"] = risk_lvl
-        _cached_overlay_data["sf_actions"] = sf_actions
-        _cached_overlay_data["height_data"] = height_data
-
-        # ── Consecutive detection tracking ──
-        if len(detections) > 0:
-            consecutive_detections += 1
-        else:
-            consecutive_detections = 0
-
-        now_ts = time.time()
-        actions = _update_tracker("camera_0", detections, now_ts)
-
-        # ── Event generation (only when activity threshold met) ──
-        if (
-            len(detections) > 0
-            and motion_counter > motion_threshold
-            and alert_cooldown == 0
-            and consecutive_detections >= CONSECUTIVE_REQUIRED
-        ):
-            print("⚠️ REAL ACTIVITY DETECTED", flush=True)
-            alert_cooldown = 30
-            motion_counter = 0
-
-            duration_label = (
-                "loitering" if "loitering" in actions else
-                "lingering" if "lingering" in actions else
-                "visitor" if "visitor" in actions else "passing"
-            ) if actions else "passing"
-
-            pose_actions = [d.get("pose_action", "unknown") for d in detections if d.get("pose_action")]
-            primary_pose = pose_actions[0] if pose_actions else "unknown"
-
-            sf_label = ""
-            if sf_actions and sf_actions[0].get("action") and sf_actions[0]["action"] != "Loading model...":
-                sf_label = sf_actions[0]["action"].capitalize()
-
-            parts = [p for p in [sf_label, primary_pose.capitalize(), duration_label] if p]
-            worst_action = " — ".join(parts) if parts else "passing"
-
-            screenshot_name = None
-            try:
-                screenshot_name = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_camera_0.jpg"
-                screenshot_path = os.path.join(SCREENSHOT_DIR, screenshot_name)
-                cv2.imwrite(screenshot_path, frame)
-            except Exception as e:
-                print(f"Screenshot save error: {e}", flush=True)
-
-            iso_ts = datetime.utcnow().isoformat()
-            event_doc = {
-                "timestamp": iso_ts,
-                "unix_ts": now_ts,
-                "detections": detections,
-                "source": "camera_0",
-                "camera_name": "Local Camera",
-                "action": worst_action,
-            }
-            if screenshot_name:
-                event_doc["screenshot_path"] = screenshot_name
-
-            try:
-                if len(detections) > 0:
-                    h_res = _estimate_height_new(detections[0], frame.shape, frame=frame)
-                    if h_res and h_res.get("height_m"):
-                        event_doc["height_m"] = h_res["height_m"]
-                        event_doc["height_confidence"] = h_res.get("confidence", 0)
-                        event_doc["height_visibility"] = h_res.get("visibility", "unknown")
-                        if h_res.get("distance_m"):
-                            event_doc["distance_m"] = h_res["distance_m"]
-            except Exception as e:
-                print("Height estimation error:", e, flush=True)
-
-            # Face matching
-            try:
-                matched = []
-                users = cached_users
-                for idx, det in enumerate(detections):
-                    if det.get("class") != "person":
-                        continue
-                    box = det.get("box")
-                    if not box:
-                        continue
-                    x1, y1, x2, y2 = [int(v) for v in box]
-                    h_box = max(1, y2 - y1)
-                    w_box = max(1, x2 - x1)
-                    pad_y = int(h_box * 0.35)
-                    pad_x = int(w_box * 0.25)
-                    xa = max(0, x1 - pad_x)
-                    ya = max(0, y1 - pad_y)
-                    xb = min(frame.shape[1], x2 + pad_x)
-                    yb = min(frame.shape[0], y2 + pad_y)
-                    crop = frame[ya:yb, xa:xb]
-                    if crop is None or crop.size == 0:
-                        continue
-                    try:
-                        face_list = get_faces_and_embeddings(crop)
-                    except Exception:
-                        face_list = []
-                    if not face_list:
-                        continue
-                    for f in face_list:
-                        emb = f.get("embedding")
-                        best = {"user_id": None, "name": None, "score": 0.0}
-                        for u in users:
-                            multi_embs = u.get("embeddings", [])
-                            stored_single = u.get("embedding")
-                            best_user_score = 0.0
-                            if multi_embs:
-                                for se in multi_embs:
-                                    s = cosine_similarity(emb, se)
-                                    if s > best_user_score:
-                                        best_user_score = s
-                            elif stored_single:
-                                best_user_score = cosine_similarity(emb, stored_single)
-                            else:
-                                continue
-                            if best_user_score > best["score"]:
-                                best = {"user_id": u.get("user_id"), "name": u.get("name"), "score": best_user_score}
-                        if best["score"] >= 0.45:
-                            matched.append(best)
-                        else:
-                            matched.append({"user_id": None, "name": "unknown", "score": best["score"]})
-                if matched:
-                    event_doc["faces"] = matched
-                else:
-                    event_doc["faces"] = [{"user_id": None, "name": "unknown", "score": 0.0}]
-            except Exception as e:
-                print("Face processing error:", e, flush=True)
-
-            risk_score, risk_level = _compute_risk(
-                event_doc.get("faces", []), actions
-            )
-            event_doc["risk_score"] = risk_score
-            event_doc["risk_level"] = risk_level
-            print(f"   Risk: {risk_level} (score={risk_score}), Action: {worst_action}", flush=True)
-
-            try:
-                events_collection.insert_one(event_doc)
-            except Exception:
-                pass
-
-            activity_state["active"] = True
-            activity_state["last_event"] = iso_ts
-            activity_state["last_detections"] = detections
-            activity_state["risk_level"] = risk_level
-            activity_state["active_until"] = time.time() + 5
-
-        # Housekeeping
-        if activity_state.get("active_until") and time.time() > activity_state.get("active_until"):
-            activity_state["active"] = False
-            activity_state["active_until"] = None
-        if alert_cooldown > 0:
-            alert_cooldown -= 1
-
-
-# Start ML worker thread once
-_ml_thread = threading.Thread(target=_ml_worker, daemon=True)
-_ml_thread.start()
-
-
-# ── Shared display frame for MJPEG streaming ──────────────────────
-# Only ONE thread (the camera reader) reads from the camera and composes
-# the display frame.  All MJPEG Response generators just copy this buffer,
-# preventing the "split/mirror" glitch caused by multiple concurrent readers.
-_display_frame = None
-_display_frame_lock = threading.Lock()
-
-
-def _camera_reader():
-    """
-    Single background thread that reads the camera at native FPS,
-    draws cached ML overlays, and stores the composed frame in
-    _display_frame.  MJPEG generators read from there.
-    """
-    global camera, _latest_frame, _display_frame
-    global camera_paused
-
-    print("⚙️  Camera reader thread started", flush=True)
-
-    while True:
-        if camera_paused:
-            try:
-                if camera and camera.isOpened():
-                    camera.release()
-            except Exception:
-                pass
-            time.sleep(0.05)
-            continue
-
-        if not camera.isOpened():
-            camera = get_camera()
-
-        success, frame = camera.read()
-        if not success or frame is None:
-            camera.release()
-            camera = get_camera()
-            continue
-
-        # Share raw frame with ML worker
-        with _latest_frame_lock:
-            _latest_frame = frame
-
-        # Encode raw frame (no overlays) for maximum FPS
-        _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        with _display_frame_lock:
-            _display_frame = buffer.tobytes()
-
-
-# Start the single camera reader thread
-_cam_reader_thread = threading.Thread(target=_camera_reader, daemon=True)
-_cam_reader_thread.start()
-
-
-def generate_frames():
-    """
-    MJPEG generator — yields the latest composed display frame.
-    Multiple connections can call this safely; they all read from
-    the same shared buffer (no camera contention).
-    """
-    while True:
-        with _display_frame_lock:
-            frame_bytes = _display_frame
-
-        if frame_bytes is None:
-            time.sleep(0.03)
-            continue
-
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
-        )
-        time.sleep(0.016)  # ~60 FPS cap per client
-
-@app.route("/video_feed")
-def video_feed():
-    return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
-
-
-@app.get("/api/detections")
-def get_detections():
-    """
-    Return real-time detection data as JSON for the frontend side panel.
-    Uses SlowFast activity when confident, falls back to YOLO pose otherwise.
-    """
-    overlay = _cached_overlay_data
-    detections = overlay.get("detections", [])
-    sf_actions = overlay.get("sf_actions", [])
-    height_data = overlay.get("height_data", [])
-    risk_level = overlay.get("risk_level", "LOW")
-
-    persons = []
-    for i, det in enumerate(detections):
-        if det.get("class") != "person":
-            continue
-        h_info = height_data[i] if i < len(height_data) else {}
-        person = {
-            "confidence": det.get("confidence", 0),
-            "pose": det.get("pose_action", "unknown"),
-            "height_m": h_info.get("height_m"),
-            "raw_height_m": h_info.get("raw_height_m"),
-            "height_confidence": h_info.get("confidence"),
-            "margin_m": h_info.get("margin_m"),
-            "distance_m": h_info.get("distance_m"),
-            "visibility": h_info.get("visibility", "unknown"),
-            "quality_score": h_info.get("quality_score"),
-            "depth_method": h_info.get("depth_method"),
-            "calibration": h_info.get("calibration"),
-            "method": h_info.get("method"),
-            "kalman_updates": h_info.get("kalman_updates", 0),
-        }
-        persons.append(person)
-
-    # SlowFast now returns ONLY security-relevant actions (pre-filtered).
-    # Its own MIN_CONFIDENCE already gates garbage, so we trust its output.
-    ACTIVITY_CONF_THRESHOLD = 0.08
-    activities = []
-    for a in sf_actions:
-        if (a.get("action")
-            and a["action"] != "Loading model..."
-            and a.get("confidence", 0) >= ACTIVITY_CONF_THRESHOLD):
-            activities.append({
-                "action": a["action"],
-                "confidence": a.get("confidence", 0),
-            })
-
-    # Fallback: if no confident SlowFast activity, use YOLO pose as the activity
-    if not activities and persons:
-        pose = persons[0].get("pose", "unknown")
-        if pose and pose != "unknown":
-            activities.append({
-                "action": pose.replace("_", " "),
-                "confidence": 0.9,  # pose-based, high confidence
-            })
-        else:
-            activities.append({"action": "idle", "confidence": 1.0})
-
-    return jsonify({
-        "persons": persons,
-        "activities": activities,
-        "risk_level": risk_level,
-        "person_count": len(persons),
-        "model_ready": activity_recognizer.is_ready,
-    })
-
-
-@app.post("/camera/pause")
-def pause_camera():
-    """Pause the internal camera loop and release the device so other apps (browser) can use it."""
-    global camera_paused, camera
-    try:
-        camera_paused = True
-        if camera and camera.isOpened():
-            camera.release()
-        return jsonify({"ok": True, "paused": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.post("/camera/resume")
-def resume_camera():
-    """Resume internal camera loop and reacquire the device."""
-    global camera_paused, camera
-    try:
-        camera_paused = False
-        # re-open camera immediately
-        try:
-            if camera is None or not camera.isOpened():
-                camera = get_camera()
-        except Exception:
-            pass
-        return jsonify({"ok": True, "paused": False})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.get("/camera/state")
-def camera_state():
-    return jsonify({"paused": bool(camera_paused), "camera_open": bool(camera.isOpened())})
-
-
-@app.route("/enroll", methods=["POST"])
-def enroll_user():
-    """Enroll a user by posting form-data `name` and `image` file, or JSON with `name` and `image_base64`."""
-    name = None
-    img_bgr = None
-    if request.content_type and request.content_type.startswith("multipart/form-data"):
-        name = request.form.get("name")
-        img_file = request.files.get("image")
-        if img_file:
-            arr = np.frombuffer(img_file.read(), np.uint8)
-            img_bgr = cv2_local.imdecode(arr, cv2_local.IMREAD_COLOR)
-    else:
-        data = request.get_json(silent=True) or {}
-        name = data.get("name")
-        img_b64 = data.get("image_base64")
-        if img_b64:
-            img_bytes = base64.b64decode(img_b64.split(",")[-1])
-            arr = np.frombuffer(img_bytes, np.uint8)
-            img_bgr = cv2_local.imdecode(arr, cv2_local.IMREAD_COLOR)
-
-    if img_bgr is None or name is None:
-        return jsonify({"error": "Provide 'name' and image (file or image_base64)"}), 400
-
-    faces = get_faces_and_embeddings(img_bgr)
-    if len(faces) == 0:
-        return jsonify({"error": "No face found in image"}), 400
-
-    emb = faces[0]["embedding"].tolist()
-    user_id = str(uuid.uuid4())
-    users_collection.insert_one({
-        "user_id": user_id,
-        "name": name,
-        "embedding": emb,
-        "created_at": datetime.utcnow().isoformat()
-    })
-    # update in-memory cache so matching picks this up immediately
-    try:
-        cached_users.append({"user_id": user_id, "name": name, "embedding": emb})
-    except Exception:
-        # fallback: reload entire cache
-        load_users_cache()
-    return jsonify({"user_id": user_id, "name": name})
-
-
-@app.route("/api/register", methods=["POST"])
-def register_user():
-    """Register a user with several base64 images. JSON: { name: str, images_base64: [dataurl,...] }
-    Returns: { user_id, name, samples, rejected, quality_scores }
-    """
-    data = request.get_json(silent=True) or {}
-    name = data.get("name")
-    images = data.get("images_base64") or []
-    if not name or not images:
-        return jsonify({"error": "Provide 'name' and 'images_base64' list"}), 400
-
-    embeddings = []
-    quality_scores = []
-    rejected = 0
-    samples = 0
-
-    for idx, img_b64 in enumerate(images):
-        score = {"index": idx, "accepted": False, "reason": None, "blur": 0.0, "brightness": 128.0}
-        try:
-            if "," in img_b64:
-                img_b64 = img_b64.split(",")[1]
-            img_bytes = base64.b64decode(img_b64)
-            arr = np.frombuffer(img_bytes, np.uint8)
-            img_bgr = cv2_local.imdecode(arr, cv2_local.IMREAD_COLOR)
-
-            if img_bgr is None or img_bgr.size == 0:
-                score["reason"] = "decode_failed"
-                rejected += 1
-                quality_scores.append(score)
-                continue
-
-            # Resize if too small
-            h, w = img_bgr.shape[:2]
-            if h < 150 or w < 150:
-                scale = max(150 / h, 150 / w)
-                img_bgr = cv2_local.resize(img_bgr, (int(w * scale), int(h * scale)))
-
-            faces = get_faces_and_embeddings(img_bgr)
-            if not faces:
-                score["reason"] = "no_face"
-                rejected += 1
-                quality_scores.append(score)
-                continue
-
-            # Quality checks on the face crop
-            box = faces[0].get("box", [0, 0, img_bgr.shape[1], img_bgr.shape[0]])
-            x1, y1, x2, y2 = box
-            crop = img_bgr[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-            if crop.size > 0:
-                blur = compute_blur_score(crop)
-                bright = compute_brightness(crop)
-                score["blur"] = round(blur, 1)
-                score["brightness"] = round(bright, 1)
-
-                if blur < 20.0:
-                    score["reason"] = "too_blurry"
-                    rejected += 1
-                    quality_scores.append(score)
-                    print(f"register: image {idx} rejected (blur={blur:.1f})", flush=True)
-                    continue
-                if bright < 40.0 or bright > 230.0:
-                    score["reason"] = "bad_lighting"
-                    rejected += 1
-                    quality_scores.append(score)
-                    print(f"register: image {idx} rejected (brightness={bright:.1f})", flush=True)
-                    continue
-
-            emb = faces[0].get("embedding")
-            if emb is not None:
-                embeddings.append(np.array(emb).tolist())
-                samples += 1
-                score["accepted"] = True
-                print(f"register: image {idx} accepted (blur={score['blur']}, bright={score['brightness']})", flush=True)
-        except Exception as e:
-            score["reason"] = str(e)
-            rejected += 1
-            print(f"register: image {idx} error: {e}", flush=True)
-        quality_scores.append(score)
-
-    if len(embeddings) == 0:
-        return jsonify({"error": "No usable faces found in provided images", "quality_scores": quality_scores}), 400
-
-    # Store individual embeddings (not averaged) for best-of-N matching
-    try:
-        user_id = str(uuid.uuid4())
-        # Also compute average for backward compatibility
-        avg = np.mean(np.stack([np.array(e) for e in embeddings], axis=0), axis=0).tolist()
-        users_collection.insert_one({
-            "user_id": user_id,
-            "name": name,
-            "embedding": avg,
-            "embeddings": embeddings,  # store all individual embeddings
-            "samples": samples,
-            "created_at": datetime.utcnow().isoformat(),
-        })
-        # Update cache with all embeddings
-        try:
-            cached_users.append({"user_id": user_id, "name": name, "embedding": avg, "embeddings": embeddings})
-        except Exception:
-            load_users_cache()
-        print(f"register: user {name} registered with {samples} samples, {rejected} rejected", flush=True)
-        return jsonify({"user_id": user_id, "name": name, "samples": samples, "rejected": rejected, "quality_scores": quality_scores})
-    except Exception as e:
-        print(f"register: storage error: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/set_reference", methods=["POST"])
-def set_reference():
-    """Set a reference object height so the system can compute meters_per_pixel.
-
-    POST JSON: { "reference_height_m": 1.95, "reference_pixels": 400 }
-    - reference_height_m: real world height of the reference object in meters
-    - reference_pixels: pixel height measured in the same camera frame (pixels)
-    """
-    data = request.get_json(silent=True) or {}
-    try:
-        h_m = float(data.get("reference_height_m"))
-        pixels = float(data.get("reference_pixels"))
-        if pixels <= 0 or h_m <= 0:
-            return jsonify({"error": "reference_height_m and reference_pixels must be positive"}), 400
-        meters_per_pixel = h_m / pixels
-        reference_scale["meters_per_pixel"] = meters_per_pixel
-        reference_scale["reference_height_m"] = h_m
-        reference_scale["reference_pixels"] = pixels
-        return jsonify({"meters_per_pixel": meters_per_pixel, "reference_height_m": h_m, "reference_pixels": pixels})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.get("/users")
-def list_users():
-    """Return enrolled users (id + name). Does NOT return embeddings."""
-    try:
-        users = [{"user_id": u.get("user_id"), "name": u.get("name"), "created_at": u.get("created_at")} for u in users_collection.find({}, {"embedding": 0}).sort("created_at", -1)]
-        return jsonify(users)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.get("/events")
-def get_events():
-    """
-    Return recent events from MongoDB (latest first).
-    """
-    docs = list(events_collection.find().sort("unix_ts", -1).limit(50))
-    results = []
-    for d in docs:
-        results.append({
-            "timestamp": d.get("timestamp"),
-            "detections": d.get("detections", []),
-            "faces": d.get("faces", []),
-            "source": d.get("source"),
-            "camera_name": d.get("camera_name", ""),
-            "action": d.get("action", ""),
-            "risk_level": d.get("risk_level", ""),
-            "risk_score": d.get("risk_score"),
-            "screenshot_path": d.get("screenshot_path", ""),
-            "height_m": d.get("height_m"),
-        })
-    return jsonify(results)
-
 
 @app.get("/status")
+@app.get("/api/status")
 def status():
-    """Return basic backend health: Flask up, Mongo ping, camera state."""
-    mongo_ok = False
-    mongo_msg = ""
+    mongo_ok, mongo_msg = False, ""
     try:
         client.admin.command("ping")
         mongo_ok = True
     except Exception as e:
         mongo_msg = str(e)
-
-    cam_ok = False
-    try:
-        cam_ok = camera.isOpened()
-    except Exception as e:
-        cam_ok = False
-        mongo_msg = mongo_msg or str(e)
-
+    cam = get_pipeline()
     return jsonify({
         "service": "ok",
         "mongo": {"ok": mongo_ok, "error": mongo_msg},
-        "camera_open": bool(cam_ok),
+        "camera_open": bool(cam and cam.status == "online"),
     })
 
 
-@app.get("/config")
-def get_config():
-    """Return current runtime configuration for tunables."""
+def models_status():
+    import torch
+    return {
+        "device": detector.DEVICE,
+        "gpu": torch.cuda.get_device_name(0) if detector.DEVICE == "cuda" else None,
+        "torch": torch.__version__,
+        "pose": {"model": os.path.basename(detector.MODEL_PATH), "ready": True, "device": detector.DEVICE},
+        "activity": ctx.action.status(),
+        "depth": ctx.depth.status(),
+        "face": {"backend": face_utils.BACKEND_ID, "available": face_utils.is_available(),
+                 "error": face_utils.BACKEND_ERROR},
+        "clips": {"enabled": ctx.clips_enabled, "pre_s": clips.PRE_S, "post_s": clips.POST_S},
+        "auth": {"required": not auth.disabled},
+    }
+
+
+@app.get("/api/system/info")
+def system_info():
     return jsonify({
-        "motion_threshold": motion_threshold,
-        "alert_cooldown": alert_cooldown,
-        "consecutive_required": CONSECUTIVE_REQUIRED,
-        "confidence_threshold": CONF_THRESHOLD,
+        "demo_mode": DEMO_MODE,
+        "pipeline_version": PIPELINE_VERSION,
+        "models": {
+            "pose": "YOLOv8n-Pose (COCO 17 keypoints)",
+            "activity": "SlowFast R50 (Kinetics-400, curated categories)" if ctx.action.enabled else "disabled",
+            "depth": f"MiDaS {ctx.depth.model_type} (relative depth only)" if ctx.depth.enabled else "disabled",
+            "face": {"facenet-vggface2": "FaceNet InceptionResnetV1 (VGGFace2) + MTCNN",
+                     "deepface-arcface": "ArcFace (DeepFace)"}.get(face_utils.BACKEND_ID, "disabled"),
+        },
+        "runtime": models_status(),
+        "features": [
+            "Pose-based posture: walking, running, falling, lying down, fighting",
+            "Activity recognition on person-centred clips (fighting, falls, running, climbing)",
+            "Dwell-time loitering detection",
+            "Height from calibrated ground-plane geometry",
+            "Face recognition with backend-safe enrollment",
+            "Multi-camera (USB / IP / RTSP), one pipeline per camera",
+            "Live push updates (Server-Sent Events)",
+            "Overlays drawn on the live stream (boxes, skeletons, identity, risk)",
+            "A short video clip saved around every event",
+            "Password-protected API, streams and enrollment",
+            "Measured performance at /api/perf",
+        ],
     })
 
 
-@app.post("/config")
-def set_config():
-    """Update runtime configuration. POST JSON with any of: motion_threshold, alert_cooldown, consecutive_required, confidence_threshold"""
-    global motion_threshold, alert_cooldown, CONSECUTIVE_REQUIRED, CONF_THRESHOLD
-    data = request.get_json(silent=True) or {}
-    try:
-        if "motion_threshold" in data:
-            motion_threshold = int(data.get("motion_threshold"))
-        if "alert_cooldown" in data:
-            alert_cooldown = int(data.get("alert_cooldown"))
-        if "consecutive_required" in data:
-            CONSECUTIVE_REQUIRED = int(data.get("consecutive_required"))
-        if "confidence_threshold" in data:
-            CONF_THRESHOLD = float(data.get("confidence_threshold"))
-        return jsonify({"ok": True, "config": {"motion_threshold": motion_threshold, "alert_cooldown": alert_cooldown, "consecutive_required": CONSECUTIVE_REQUIRED, "confidence_threshold": CONF_THRESHOLD}})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
-
-
-@app.get("/stats")
-def stats():
-    """Return simple stats: events last hour and today."""
-    now_ts = time.time()
-    one_hour = now_ts - 3600
-    try:
-        events_last_hour = events_collection.count_documents({"unix_ts": {"$gte": one_hour}})
-    except Exception:
-        events_last_hour = 0
-
-    # start of today (UTC)
-    try:
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        events_today = events_collection.count_documents({"unix_ts": {"$gte": today_start}})
-    except Exception:
-        events_today = 0
-
-    return jsonify({"events_last_hour": events_last_hour, "events_today": events_today})
+@app.get("/api/perf")
+def get_perf():
+    cams = {cid: p.perf.report() for cid, p in list(pipelines.items())}
+    default = cams.get(DEFAULT_CAM, {})
+    return jsonify({
+        **models_status(),
+        "torch_cuda_available": detector.DEVICE == "cuda",
+        "cameras": cams,
+        # top-level fields mirror the default camera for simple consumers
+        **{k: default.get(k) for k in ("capture_fps", "pipeline_fps", "frames_captured",
+                                       "frames_processed", "events_written", "stages", "latency")},
+        "stream_subscribers": ctx.bus.subscriber_count,
+    })
 
 
 # =====================================================================
-#  CAMERA CALIBRATION API
+#  Live data
+# =====================================================================
+
+@app.get("/api/stream")
+def stream():
+    """Server-Sent Events: `detections` (≤10 Hz per camera) and `event` messages."""
+    q = ctx.bus.subscribe()
+
+    def gen():
+        import json
+        try:
+            yield "retry: 2000\n\n"
+            for p in list(pipelines.values()):
+                yield f"event: detections\ndata: {json.dumps(p.snapshot(), default=str)}\n\n"
+            while True:
+                try:
+                    yield q.get(timeout=15)
+                except queue.Empty:
+                    yield ": keep-alive\n\n"
+        finally:
+            ctx.bus.unsubscribe(q)
+
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/detections")
+def get_detections():
+    p = get_pipeline(request.args.get("camera_id"))
+    if p is None:
+        return _json_error("camera not found", 404)
+    return jsonify(p.snapshot())
+
+
+@app.get("/activity_status")
+@app.get("/api/activity_status")
+def activity_status():
+    p = get_pipeline(request.args.get("camera_id"))
+    snap = p.snapshot() if p else {}
+    last = p.last_event if p else None
+    return jsonify({
+        "active": bool(last and time.time() - last["unix_ts"] < 5),
+        "last_event": last["timestamp"] if last else None,
+        "risk_level": snap.get("risk_level", "LOW"),
+        "person_count": snap.get("person_count", 0),
+    })
+
+
+def _pipeline_video(cam_id):
+    p = get_pipeline(cam_id)
+    if p is None:
+        return _json_error("camera not found", 404)
+    return Response(p.mjpeg(), mimetype="multipart/x-mixed-replace; boundary=frame",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/video_feed")
+@app.route("/api/video_feed")
+def video_feed():
+    return _pipeline_video(DEFAULT_CAM)
+
+
+@app.post("/camera/pause")
+@app.post("/api/camera/pause")
+def pause_camera():
+    get_pipeline().pause()
+    return jsonify({"ok": True, "paused": True})
+
+
+@app.post("/camera/resume")
+@app.post("/api/camera/resume")
+def resume_camera():
+    get_pipeline().resume()
+    return jsonify({"ok": True, "paused": False})
+
+
+@app.get("/camera/state")
+@app.get("/api/camera/state")
+def camera_state():
+    p = get_pipeline()
+    return jsonify({"paused": p.paused, "camera_open": p.status == "online"})
+
+
+# =====================================================================
+#  Events / stats / metrics
+# =====================================================================
+
+def _event_out(d):
+    d.pop("_id", None)
+    return d
+
+
+@app.get("/events")
+@app.get("/api/events")
+def get_events():
+    limit = min(500, int(request.args.get("limit", 50)))
+    q = {}
+    if request.args.get("camera_id"):
+        q["source"] = request.args["camera_id"]
+    if request.args.get("since"):
+        q["unix_ts"] = {"$gt": float(request.args["since"])}
+    try:
+        docs = list(events_collection.find(q).sort("unix_ts", -1).limit(limit))
+    except Exception as e:
+        return _json_error(f"database unavailable: {e}", 503)
+    return jsonify([_event_out(d) for d in docs])
+
+
+@app.get("/stats")
+@app.get("/api/stats")
+def stats():
+    now = time.time()
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    try:
+        return jsonify({
+            "events_last_hour": events_collection.count_documents({"unix_ts": {"$gte": now - 3600}}),
+            "events_today": events_collection.count_documents({"unix_ts": {"$gte": today}}),
+        })
+    except Exception:
+        return jsonify({"events_last_hour": 0, "events_today": 0})
+
+
+def _is_real_face(f):
+    # Pre-2.0 events stored a placeholder {"name": "unknown", "score": 0.0} when no face was visible.
+    return not (f.get("name") == "unknown" and not f.get("score"))
+
+
+@app.get("/api/metrics")
+def get_metrics():
+    now = time.time()
+    since = now - 86400
+    q = {"unix_ts": {"$gte": since}}
+    if request.args.get("version"):
+        q["pipeline_version"] = request.args["version"]
+    try:
+        recent = list(events_collection.find(q, {"_id": 0, "unix_ts": 1, "action": 1, "risk_level": 1,
+                                                  "faces": 1, "detections": 1, "trigger": 1,
+                                                  "activities": 1}))
+    except Exception:
+        recent = []
+
+    hours = Counter(max(0, min(23, int((ev.get("unix_ts", 0) - since) / 3600))) for ev in recent)
+    triggers = Counter()
+    for ev in recent:
+        cats = [a.get("category") for a in ev.get("activities") or [] if a.get("category")]
+        triggers[ev.get("trigger") or (cats[0] if cats else None) or "activity"] += 1
+    conf = Counter()
+    for ev in recent:
+        for d in ev.get("detections", []):
+            conf[min(9, int(float(d.get("confidence", 0)) * 10))] += 1
+    risks = Counter(ev.get("risk_level", "LOW") for ev in recent)
+    faces = [f for ev in recent for f in (ev.get("faces") or []) if _is_real_face(f)]
+    known = sum(1 for f in faces if f.get("name") and f["name"] != "unknown")
+
+    return jsonify({
+        "events_by_hour": [{"hour": h, "count": hours.get(h, 0)} for h in range(24)],
+        "detection_distribution": [{"action": a, "count": c} for a, c in triggers.most_common()],
+        "confidence_histogram": [{"range": f"{b * 10}-{b * 10 + 10}%", "count": conf.get(b, 0)} for b in range(10)],
+        "risk_distribution": [{"level": l, "count": risks.get(l, 0)} for l in ("LOW", "MEDIUM", "HIGH")],
+        "face_match_rate": round(known / len(faces) * 100, 1) if faces else 0,
+        "face_observations": len(faces),
+        "face_match_rate_note": "share of visible faces matched to an enrolled person — not accuracy",
+        "total_events_24h": len(recent),
+    })
+
+
+@app.route("/api/screenshots/<path:filename>")
+def serve_screenshot(filename):
+    return send_from_directory(SCREENSHOT_DIR, filename)
+
+
+@app.route("/api/clips/<cam_id>/<path:filename>")
+def serve_clip(cam_id, filename):
+    """Event video. Sent with Range support so the browser can seek."""
+    return send_from_directory(os.path.join(CLIP_DIR, cam_id), filename, conditional=True)
+
+
+# =====================================================================
+#  Runtime config
+# =====================================================================
+
+@app.get("/config")
+@app.get("/api/config")
+def get_config():
+    return jsonify(ctx.settings.as_dict())
+
+
+@app.post("/config")
+@app.post("/api/config")
+def set_config():
+    try:
+        ctx.settings.update(request.get_json(silent=True) or {})
+    except (TypeError, ValueError) as e:
+        return _json_error(str(e))
+    return jsonify({"ok": True, "config": ctx.settings.as_dict()})
+
+
+# =====================================================================
+#  Identities
+# =====================================================================
+
+def _embed_images(images, check_quality):
+    """Returns (embeddings, quality_scores, rejected)."""
+    embeddings, scores, rejected = [], [], 0
+    for idx, img in enumerate(images):
+        score = {"index": idx, "accepted": False, "reason": None, "blur": 0.0, "brightness": 128.0}
+        try:
+            if img is None or img.size == 0:
+                raise ValueError("decode_failed")
+            h, w = img.shape[:2]
+            if min(h, w) < 150:
+                s = 150 / min(h, w)
+                img = cv2.resize(img, (int(w * s), int(h * s)))
+            faces = face_utils.get_faces_and_embeddings(img)
+            if not faces:
+                raise ValueError("no_face")
+            if len(faces) > 1:
+                raise ValueError("multiple_faces")
+            x1, y1, x2, y2 = faces[0]["box"]
+            crop = img[y1:y2, x1:x2]
+            score["blur"] = round(face_utils.compute_blur_score(crop), 1)
+            score["brightness"] = round(face_utils.compute_brightness(crop), 1)
+            if check_quality and score["blur"] < 20.0:
+                raise ValueError("too_blurry")
+            if check_quality and not 40.0 <= score["brightness"] <= 230.0:
+                raise ValueError("bad_lighting")
+            embeddings.append(faces[0]["embedding"])
+            score["accepted"] = True
+        except ValueError as e:
+            score["reason"] = str(e)
+            rejected += 1
+        except Exception as e:
+            score["reason"] = f"error: {e}"
+            rejected += 1
+        scores.append(score)
+    return embeddings, scores, rejected
+
+
+def _enroll(name, images, check_quality):
+    if not face_utils.is_available():
+        return _json_error(f"face recognition is disabled ({face_utils.BACKEND_ERROR or 'FACE_BACKEND=none'})", 503)
+    if not name or not name.strip():
+        return _json_error("Provide a non-empty 'name'")
+    embeddings, scores, rejected = _embed_images(images, check_quality)
+    if not embeddings:
+        return _json_error("No usable faces found in provided images", quality_scores=scores)
+    user_id, total, created = ctx.identity.enroll(name, embeddings)
+    return jsonify({"user_id": user_id, "name": name.strip(), "samples": len(embeddings),
+                    "total_samples": total, "created": created, "rejected": rejected,
+                    "quality_scores": scores, "face_backend": face_utils.BACKEND_ID})
+
+
+@app.route("/enroll", methods=["POST"])
+@app.route("/api/enroll", methods=["POST"])
+def enroll_user():
+    """multipart: name + image, or JSON: {name, image_base64}"""
+    if request.content_type and request.content_type.startswith("multipart/form-data"):
+        name = request.form.get("name")
+        f = request.files.get("image")
+        img = cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR) if f else None
+    else:
+        data = request.get_json(silent=True) or {}
+        name, img = data.get("name"), _decode_image(data.get("image_base64"))
+    if img is None:
+        return _json_error("Provide 'name' and an image (file or image_base64)")
+    return _enroll(name, [img], check_quality=False)
+
+
+@app.route("/api/register", methods=["POST"])
+def register_user():
+    """JSON: {name, images_base64: [dataurl, ...]}. Adds to an existing user with the same name."""
+    data = request.get_json(silent=True) or {}
+    images = []
+    for b64 in data.get("images_base64") or []:
+        try:
+            images.append(_decode_image(b64))
+        except Exception:
+            images.append(None)
+    if not images:
+        return _json_error("Provide 'name' and 'images_base64' list")
+    return _enroll(data.get("name"), images, check_quality=True)
+
+
+@app.get("/users")
+@app.get("/api/users")
+def list_users():
+    return jsonify(ctx.identity.summary())
+
+
+@app.delete("/api/users/<user_id>")
+def delete_user(user_id):
+    res = users_collection.delete_one({"user_id": user_id})
+    if not res.deleted_count:
+        return _json_error("user not found", 404)
+    ctx.identity.reload()
+    return jsonify({"ok": True})
+
+
+# =====================================================================
+#  Camera intrinsics calibration
 # =====================================================================
 
 @app.get("/api/calibrate/presets")
 def calibrate_presets():
-    """List available camera presets."""
     return jsonify(list_camera_presets())
 
 
 @app.post("/api/calibrate/preset")
 def calibrate_preset():
-    """Apply a preset camera profile. JSON: { camera_id?, preset_name }"""
     data = request.get_json(silent=True) or {}
-    cam_id = data.get("camera_id", "cam_local")
-    preset_name = data.get("preset_name", "")
-    if not preset_name:
-        return jsonify({"error": "Provide 'preset_name'"}), 400
+    if not data.get("preset_name"):
+        return _json_error("Provide 'preset_name'")
     try:
-        calibrator = get_calibrator(cam_id)
-        info = calibrator.load_preset(preset_name)
-        return jsonify(info)
+        return jsonify(get_calibrator(data.get("camera_id", DEFAULT_CAM)).load_preset(data["preset_name"]))
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _json_error(str(e))
 
 
 @app.post("/api/calibrate/manual")
 def calibrate_manual():
-    """Set camera parameters manually.
-    JSON: { camera_id?, frame_width, frame_height, fov_h_deg?, focal_mm?, sensor_w_mm?, dist_coeffs? }
-    """
     data = request.get_json(silent=True) or {}
-    cam_id = data.get("camera_id", "cam_local")
     try:
-        calibrator = get_calibrator(cam_id)
-        info = calibrator.set_manual_params(
+        info = get_calibrator(data.get("camera_id", DEFAULT_CAM)).set_manual_params(
             frame_width=int(data.get("frame_width", 640)),
             frame_height=int(data.get("frame_height", 480)),
             fov_h_deg=data.get("fov_h_deg"),
@@ -1078,611 +587,257 @@ def calibrate_manual():
         )
         return jsonify(info)
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return _json_error(str(e))
 
 
 @app.post("/api/calibrate/checkerboard")
 def calibrate_checkerboard():
-    """Calibrate from checkerboard images.
-    JSON: { camera_id?, images_base64: [dataurl,...], board_size?: [9,6], square_size_mm?: 25 }
-    """
     data = request.get_json(silent=True) or {}
-    cam_id = data.get("camera_id", "cam_local")
-    images_b64 = data.get("images_base64", [])
-    board_size = tuple(data.get("board_size", [9, 6]))
-    square_size = float(data.get("square_size_mm", 25.0))
-
-    if len(images_b64) < 3:
-        return jsonify({"error": "Need at least 3 checkerboard images"}), 400
-
-    # Decode images
     images = []
-    for b64 in images_b64:
+    for b64 in data.get("images_base64", []):
         try:
-            if "," in b64:
-                b64 = b64.split(",")[1]
-            img_bytes = base64.b64decode(b64)
-            arr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2_local.imdecode(arr, cv2_local.IMREAD_COLOR)
+            img = _decode_image(b64)
             if img is not None:
                 images.append(img)
         except Exception:
             continue
-
     if len(images) < 3:
-        return jsonify({"error": f"Only {len(images)} valid images decoded (need ≥ 3)"}), 400
-
+        return _json_error(f"Need at least 3 valid checkerboard images (got {len(images)})")
     try:
-        calibrator = get_calibrator(cam_id)
-        info = calibrator.calibrate_from_checkerboard(images, board_size, square_size)
+        info = get_calibrator(data.get("camera_id", DEFAULT_CAM)).calibrate_from_checkerboard(
+            images, tuple(data.get("board_size", [9, 6])), float(data.get("square_size_mm", 25.0)))
         return jsonify(info)
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return _json_error(str(e))
 
 
 @app.get("/api/calibrate/status")
 def calibrate_status():
-    """Get calibration status for a camera. Query param: ?camera_id=cam_local"""
-    cam_id = request.args.get("camera_id", "cam_local")
-    calibrator = get_calibrator(cam_id)
-    info = calibrator.get_calibration_info()
-    info["depth_estimator"] = depth_est.get_status()
+    cam_id = request.args.get("camera_id", DEFAULT_CAM)
+    info = get_calibrator(cam_id).get_calibration_info()
+    p = get_pipeline(cam_id)
+    info["ground"] = p.ground.status() if p else None
+    info["depth_estimator"] = ctx.depth.status()
     return jsonify(info)
 
 
 @app.post("/api/calibrate/reset")
 def calibrate_reset():
-    """Reset calibration for a camera. JSON: { camera_id? }"""
     data = request.get_json(silent=True) or {}
-    cam_id = data.get("camera_id", "cam_local")
-    calibrator = get_calibrator(cam_id)
-    calibrator.reset()
-    # Also reset height estimator's legacy calibration
-    height_estimator.reset_calibration()
-    # Reset depth scale
-    depth_est.reset_scale()
+    cam_id = data.get("camera_id", DEFAULT_CAM)
+    get_calibrator(cam_id).reset()
     return jsonify({"ok": True, "camera_id": cam_id})
 
 
-from flask import send_from_directory
-
-@app.route("/api/screenshots/<path:filename>")
-def serve_screenshot(filename):
-    """Serve a saved event screenshot."""
-    return send_from_directory(SCREENSHOT_DIR, filename)
-
-
-@app.get("/api/metrics")
-def get_metrics():
-    """Return aggregated metrics for the dashboard charts."""
-    now = time.time()
-    twenty_four_h = now - 86400
-    try:
-        recent = list(events_collection.find(
-            {"unix_ts": {"$gte": twenty_four_h}},
-            {"_id": 0, "unix_ts": 1, "action": 1, "risk_level": 1,
-             "faces": 1, "detections": 1}
-        ))
-    except Exception:
-        recent = []
-
-    # 1. Events by hour (last 24h, bucketed)
-    from collections import Counter
-    hour_buckets = Counter()
-    for ev in recent:
-        h = int((ev.get("unix_ts", 0) - twenty_four_h) / 3600)
-        h = max(0, min(23, h))
-        hour_buckets[h] += 1
-    events_by_hour = [{"hour": h, "count": hour_buckets.get(h, 0)} for h in range(24)]
-
-    # 2. Detection distribution (action breakdown)
-    action_counts = Counter()
-    for ev in recent:
-        action_counts[ev.get("action", "unknown")] += 1
-    detection_distribution = [{"action": a, "count": c} for a, c in action_counts.items()]
-
-    # 3. Confidence histogram (10% buckets)
-    conf_buckets = Counter()
-    for ev in recent:
-        for d in ev.get("detections", []):
-            conf = d.get("confidence", 0)
-            bucket = min(9, int(conf * 10))
-            conf_buckets[bucket] += 1
-    confidence_histogram = [
-        {"range": f"{b*10}-{b*10+10}%", "count": conf_buckets.get(b, 0)}
-        for b in range(10)
-    ]
-
-    # 4. Risk distribution
-    risk_counts = Counter()
-    for ev in recent:
-        risk_counts[ev.get("risk_level", "MEDIUM")] += 1
-    risk_distribution = [{"level": l, "count": risk_counts.get(l, 0)}
-                         for l in ["LOW", "MEDIUM", "HIGH"]]
-
-    # 5. Face match rate
-    total_faces = 0
-    known_faces = 0
-    for ev in recent:
-        for f in ev.get("faces", []):
-            total_faces += 1
-            if f.get("name") and f["name"] != "unknown":
-                known_faces += 1
-    face_match_rate = round(known_faces / total_faces * 100, 1) if total_faces > 0 else 0
-
-    return jsonify({
-        "events_by_hour": events_by_hour,
-        "detection_distribution": detection_distribution,
-        "confidence_histogram": confidence_histogram,
-        "risk_distribution": risk_distribution,
-        "face_match_rate": face_match_rate,
-        "total_events_24h": len(recent),
-    })
-
 # =====================================================================
-#  MULTI-CAMERA MANAGEMENT
+#  Height calibration (ground plane)
 # =====================================================================
-import threading
 
-# Camera registry: list of camera dicts
-# Each: { id, name, source, type, status, capture, lock }
-camera_registry = []
-_cam_id_counter = 0
-_cam_lock = threading.Lock()
-
-
-def _next_cam_id():
-    global _cam_id_counter
-    _cam_id_counter += 1
-    return f"cam_{_cam_id_counter}"
+def _ground_intrinsics(cam_id, frame_shape):
+    cal = get_calibrator(cam_id)
+    fy = cal.get_focal_length_px(frame_shape)
+    cy = cal.get_principal_point(frame_shape)[1]
+    return fy, cy
 
 
-def _open_capture(source):
-    """Open a VideoCapture for the given source (int index or URL string)."""
-    if isinstance(source, int):
-        cap = cv2.VideoCapture(source)
-    else:
-        cap = cv2.VideoCapture(source)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    return cap
+@app.get("/api/calibrate/ground")
+def ground_status():
+    p = get_pipeline(request.args.get("camera_id"))
+    if p is None:
+        return _json_error("camera not found", 404)
+    return jsonify(p.ground.status())
 
 
-def _register_camera(name, source, cam_type="local"):
-    """Register a camera and return its dict."""
-    cam_id = _next_cam_id()
-    cap = _open_capture(source)
-    status = "online" if cap.isOpened() else "offline"
-    entry = {
-        "id": cam_id,
-        "name": name,
-        "source": source,
-        "type": cam_type,            # local | ip | rtsp
-        "status": status,
-        "capture": cap,
-        "lock": threading.Lock(),
-    }
-    with _cam_lock:
-        camera_registry.append(entry)
-    print(f"📷 Registered camera '{name}' (id={cam_id}, source={source}, status={status})", flush=True)
-    return entry
+@app.post("/api/calibrate/ground/sample")
+def ground_sample():
+    """Record a reference: a person of known height standing in view.
 
-
-def _find_cam(cam_id):
-    for c in camera_registry:
-        if c["id"] == cam_id:
-            return c
-    return None
-
-
-def _generate_cam_feed(cam_entry):
-    """MJPEG generator for a single camera — with full ML pipeline."""
-    global activity_state
-
-    cam_bg = None          # per-camera background for motion detection
-    cam_motion_ctr = 0
-    cam_consec = 0
-    cam_cooldown = 0
-    cam_frame_count = 0
-    cam_id = cam_entry.get("id", "unknown")
-    is_network = not isinstance(cam_entry.get("source"), int)
-
-    print(f"⚙️  ML pipeline started for camera '{cam_entry.get('name')}' ({cam_id})", flush=True)
-
-    while True:
-        if cam_entry.get("removed"):
-            break
-        cap = cam_entry.get("capture")
-        if cap is None or not cap.isOpened():
-            # try to reopen
-            try:
-                cap = _open_capture(cam_entry["source"])
-                cam_entry["capture"] = cap
-                cam_entry["status"] = "online" if cap.isOpened() else "offline"
-                # Minimize internal buffer for network streams
-                if is_network and cap.isOpened():
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                cam_entry["status"] = "offline"
-            if not cap or not cap.isOpened():
-                time.sleep(1)
-                continue
-
-        # For network cameras, drain stale buffered frames before reading
-        # cap.grab() discards the oldest buffered frame without decoding
-        if is_network:
-            cap.grab()
-
-        with cam_entry["lock"]:
-            ok, frame = cap.read()
-
-        if not ok or frame is None:
-            cam_entry["status"] = "offline"
-            time.sleep(0.5)
-            continue
-
-        cam_entry["status"] = "online"
-        cam_frame_count += 1
-
-        # ── Motion detection ──────────────────────────────
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (21, 21), 0)
-
-        if cam_bg is None:
-            cam_bg = gray.copy().astype("float")
-            continue
-
-        frame_delta = cv2.absdiff(cv2.convertScaleAbs(cam_bg), gray)
-        _, thresh = cv2.threshold(frame_delta, 35, 255, cv2.THRESH_BINARY)
-        thresh = cv2.dilate(thresh, None, iterations=2)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        motion = any(cv2.contourArea(c) > 4000 for c in contours)
-        cam_motion_ctr = cam_motion_ctr + 1 if motion else max(0, cam_motion_ctr - 1)
-        cv2.accumulateWeighted(gray, cam_bg, 0.1)
-
-        # ── YOLO-Pose detection ────────────────────────────
-        frame, detections = detector.detect(frame, conf=CONF_THRESHOLD)
-        detections = [
-            {
-                "class": d.get("class"),
-                "confidence": float(d.get("confidence", 0.0)),
-                "box": [float(v) for v in d.get("box", [])],
-                "pose_action": d.get("pose_action", "unknown"),
-                "height_px": d.get("height_px", 0),
-                "keypoints": d.get("keypoints"),
-            }
-            for d in detections
-            if float(d.get("confidence", 0.0)) >= CONF_THRESHOLD and d.get("class") == "person"
-        ]
-
-        # Auto-calibrate height on first standing person
-        for d in detections:
-            _auto_calibrate_new(d, frame.shape)
-
-        # Push frame to SlowFast buffer for activity recognition
-        activity_recognizer.push_frame(frame)
-        depth_est.push_frame(frame)
-
-        if len(detections) > 0:
-            cam_consec += 1
-        else:
-            cam_consec = 0
-
-        now_ts = time.time()
-
-        # ── Track persons across frames for action classification ──
-        actions = _update_tracker(cam_id, detections, now_ts)
-
-        if (
-            len(detections) > 0
-            and cam_motion_ctr > motion_threshold
-            and cam_cooldown == 0
-            and cam_consec >= CONSECUTIVE_REQUIRED
-        ):
-            print(f"⚠️ REAL ACTIVITY on {cam_entry.get('name')} ({cam_id})", flush=True)
-            cam_cooldown = 30
-            cam_motion_ctr = 0
-
-            # Determine worst action: combine pose ML + time-based tracking
-            duration_label = (
-                "loitering" if "loitering" in actions else
-                "lingering" if "lingering" in actions else
-                "visitor" if "visitor" in actions else "passing"
-            ) if actions else "passing"
-            pose_actions = [d.get("pose_action", "unknown") for d in detections if d.get("pose_action")]
-            primary_pose = pose_actions[0] if pose_actions else "unknown"
-
-            # Get SlowFast activity (Kinetics-400)
-            sf_actions = activity_recognizer.get_actions()
-            sf_label = ""
-            if sf_actions and sf_actions[0].get("action") and sf_actions[0]["action"] != "Loading model...":
-                sf_label = sf_actions[0]["action"].capitalize()
-
-            # Combined: "Climbing — Standing — lingering"
-            parts = [p for p in [sf_label, primary_pose.capitalize(), duration_label] if p]
-            worst_action = " — ".join(parts) if parts else "passing"
-
-            # Save screenshot
-            screenshot_name = None
-            try:
-                screenshot_name = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{cam_id}.jpg"
-                screenshot_path = os.path.join(SCREENSHOT_DIR, screenshot_name)
-                cv2.imwrite(screenshot_path, frame)
-            except Exception as e:
-                print(f"Screenshot save error: {e}", flush=True)
-
-            iso_ts = datetime.utcnow().isoformat()
-            event_doc = {
-                "timestamp": iso_ts,
-                "unix_ts": now_ts,
-                "detections": detections,
-                "source": cam_id,
-                "camera_name": cam_entry.get("name", ""),
-                "action": worst_action,
-            }
-            if screenshot_name:
-                event_doc["screenshot_path"] = screenshot_name
-
-            # Estimate height
-            try:
-                if len(detections) > 0:
-                    h_res = _estimate_height_new(detections[0], frame.shape, frame=frame, cam_id=cam_id)
-                    if h_res and h_res.get("height_m"):
-                        event_doc["height_m"] = h_res["height_m"]
-                        event_doc["height_confidence"] = h_res.get("confidence", 0)
-                        event_doc["height_visibility"] = h_res.get("visibility", "unknown")
-                        if h_res.get("distance_m"):
-                            event_doc["distance_m"] = h_res["distance_m"]
-            except Exception as e:
-                print(f"Height estimation error: {e}", flush=True)
-
-            # ── Face recognition ──────────────────────────
-            try:
-                matched = []
-                users = cached_users
-                for idx, det in enumerate(detections):
-                    if det.get("class") != "person":
-                        continue
-                    box = det.get("box")
-                    if not box:
-                        continue
-                    x1, y1, x2, y2 = [int(v) for v in box]
-                    h = max(1, y2 - y1)
-                    w = max(1, x2 - x1)
-                    pad_y = int(h * 0.35)
-                    pad_x = int(w * 0.25)
-                    xa = max(0, x1 - pad_x)
-                    ya = max(0, y1 - pad_y)
-                    xb = min(frame.shape[1], x2 + pad_x)
-                    yb = min(frame.shape[0], y2 + pad_y)
-                    crop = frame[ya:yb, xa:xb]
-
-                    if crop is None or crop.size == 0:
-                        continue
-
-                    try:
-                        faces = get_faces_and_embeddings(crop)
-                    except Exception:
-                        faces = []
-                    if not faces:
-                        continue
-
-                    for f in faces:
-                        emb = f.get("embedding")
-                        best = {"user_id": None, "name": None, "score": 0.0}
-                        for u in users:
-                            multi_embs = u.get("embeddings", [])
-                            stored_single = u.get("embedding")
-                            best_user_score = 0.0
-                            if multi_embs:
-                                for se in multi_embs:
-                                    s = cosine_similarity(emb, se)
-                                    if s > best_user_score:
-                                        best_user_score = s
-                            elif stored_single:
-                                best_user_score = cosine_similarity(emb, stored_single)
-                            else:
-                                continue
-                            if best_user_score > best["score"]:
-                                best = {"user_id": u.get("user_id"), "name": u.get("name"), "score": best_user_score}
-                        if best["score"] >= 0.45:
-                            matched.append(best)
-                        else:
-                            matched.append({"user_id": None, "name": "unknown", "score": best["score"]})
-
-                if matched:
-                    event_doc["faces"] = matched
-                else:
-                    event_doc["faces"] = [{"user_id": None, "name": "unknown", "score": 0.0}]
-            except Exception as e:
-                print(f"Face processing error on {cam_id}: {e}", flush=True)
-
-            # ── Compute risk score ──
-            risk_score, risk_level = _compute_risk(
-                event_doc.get("faces", []), actions
-            )
-            event_doc["risk_score"] = risk_score
-            event_doc["risk_level"] = risk_level
-            print(f"   Risk: {risk_level} (score={risk_score}), Action: {worst_action}", flush=True)
-
-            # ── Store event ─────────────────────────────────────────
-            try:
-                events_collection.insert_one(event_doc)
-            except Exception as e:
-                print(f"Mongo insert error: {e}", flush=True)
-
-            activity_state["active"] = True
-            activity_state["last_event"] = iso_ts
-            activity_state["last_detections"] = detections
-            activity_state["risk_level"] = risk_level
-            activity_state["active_until"] = time.time() + 5
-
-        # Decay activity and cooldown
-        if activity_state.get("active_until") and time.time() > activity_state.get("active_until"):
-            activity_state["active"] = False
-            activity_state["active_until"] = None
-        if cam_cooldown > 0:
-            cam_cooldown -= 1
-
-        # ── Encode raw frame (no overlays) for max FPS ──
-        _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
-        )
-
-
-# Auto-register the local webcam (index 0) — but DON'T open it if paused
-# We register it lazily so it doesn't conflict with the existing generate_frames
-_local_cam = {
-    "id": "cam_local",
-    "name": "Local Camera",
-    "source": 0,
-    "type": "local",
-    "status": "online",
-    "capture": None,   # uses the existing 'camera' global
-    "lock": threading.Lock(),
-    "is_default": True,
-}
-camera_registry.append(_local_cam)
-_cam_id_counter = 1  # start additional cameras from cam_2
-
-
-@app.route("/api/cameras", methods=["GET"])
-def list_cameras():
-    """List all registered cameras."""
-    result = []
-    for c in camera_registry:
-        # refresh status
-        cap = c.get("capture")
-        if c.get("is_default"):
-            c["status"] = "online" if (not camera_paused and camera and camera.isOpened()) else "paused" if camera_paused else "offline"
-        elif cap and cap.isOpened():
-            c["status"] = "online"
-        else:
-            c["status"] = "offline"
-        result.append({
-            "id": c["id"],
-            "name": c["name"],
-            "source": str(c["source"]),
-            "type": c["type"],
-            "status": c["status"],
-        })
-    return jsonify(result)
-
-
-@app.route("/api/cameras", methods=["POST"])
-def add_camera():
-    """Add a new IP / RTSP camera. JSON: { name, source }
-    source can be a URL (http://..., rtsp://...) or an integer device index.
+    JSON: {camera_id?, height_m, track_id?}. With several people in view, pass track_id
+    (from /api/detections). Record samples at several distances from the camera.
     """
+    import height_geometry
     data = request.get_json(silent=True) or {}
-    name = data.get("name", "").strip()
-    source = data.get("source", "").strip()
+    p = get_pipeline(data.get("camera_id"))
+    if p is None:
+        return _json_error("camera not found", 404)
+    try:
+        height_m = float(data["height_m"])
+    except (KeyError, TypeError, ValueError):
+        return _json_error("Provide 'height_m' (metres)")
+    if not 0.5 < height_m < 2.6:
+        return _json_error("height_m must be between 0.5 and 2.6")
+    with p._frame_lock:
+        frame = p._frame
+    if frame is None:
+        return _json_error("camera has no frame yet", 409)
+    tracks = list(p.tracker.tracks.values())
+    if data.get("track_id"):
+        tracks = [t for t in tracks if t.id == data["track_id"]]
+    tracks = [t for t in tracks if time.time() - t.last_seen < 1.0]
+    if len(tracks) != 1:
+        return _json_error(f"need exactly one person in view (found {len(tracks)}); pass track_id", 409)
+    ok, why = height_geometry.is_measurable(tracks[0], frame.shape)
+    if not ok:
+        return _json_error(f"person is not measurable: {why}", 409)
+    rows = height_geometry.rows_from_track(tracks[0])
+    sample = {**rows, "height_m": height_m, "resolution": [frame.shape[1], frame.shape[0]],
+              "ts": time.time()}
+    n = p.ground.add_sample(sample)
+    return jsonify({"ok": True, "sample": sample, "samples": n})
+
+
+@app.post("/api/calibrate/ground/solve")
+def ground_solve():
+    """JSON: {camera_id?, camera_height_m?}. Fits camera height + tilt; fixes the height if given."""
+    data = request.get_json(silent=True) or {}
+    p = get_pipeline(data.get("camera_id"))
+    if p is None:
+        return _json_error("camera not found", 404)
+    with p._frame_lock:
+        frame = p._frame
+    if frame is None:
+        return _json_error("camera has no frame yet", 409)
+    fy, cy = _ground_intrinsics(p.cam_id, frame.shape)
+    cam_h = data.get("camera_height_m")
+    try:
+        result = p.ground.solve(fy, cy, (frame.shape[1], frame.shape[0]),
+                                float(cam_h) if cam_h not in (None, "") else None)
+    except ValueError as e:
+        return _json_error(str(e))
+    return jsonify({"ok": True, "params": result})
+
+
+@app.post("/api/calibrate/ground/manual")
+def ground_manual():
+    """JSON: {camera_id?, camera_height_m, tilt_deg} — for installers who measured the mount."""
+    data = request.get_json(silent=True) or {}
+    p = get_pipeline(data.get("camera_id"))
+    if p is None:
+        return _json_error("camera not found", 404)
+    with p._frame_lock:
+        frame = p._frame
+    if frame is None:
+        return _json_error("camera has no frame yet", 409)
+    try:
+        fy, cy = _ground_intrinsics(p.cam_id, frame.shape)
+        p.ground.params = {"camera_height_m": float(data["camera_height_m"]),
+                           "tilt_deg": float(data["tilt_deg"]), "fy": fy, "cy": cy,
+                           "resolution": [frame.shape[1], frame.shape[0]], "rms_cm": None,
+                           "loo_rms_cm": None, "n_samples": 0, "method": "manual"}
+        p.ground._save()
+    except (KeyError, TypeError, ValueError):
+        return _json_error("Provide 'camera_height_m' and 'tilt_deg'")
+    return jsonify({"ok": True, "params": p.ground.params})
+
+
+@app.post("/api/calibrate/ground/reset")
+def ground_reset():
+    data = request.get_json(silent=True) or {}
+    p = get_pipeline(data.get("camera_id"))
+    if p is None:
+        return _json_error("camera not found", 404)
+    p.ground.clear()
+    for t in p.tracker.tracks.values():
+        t.heights.clear()
+    return jsonify({"ok": True})
+
+
+# =====================================================================
+#  Cameras
+# =====================================================================
+
+@app.get("/api/cameras")
+def list_cameras():
+    return jsonify([p.info() for p in list(pipelines.values())])
+
+
+@app.post("/api/cameras")
+def add_camera():
+    """JSON: {name, source} — source is a device index or http:// / rtsp:// URL."""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    source = str(data.get("source", "")).strip()
     if not name or not source:
-        return jsonify({"error": "Provide 'name' and 'source'"}), 400
-
-    # auto-detect type
-    cam_type = "ip"
-    if source.startswith("rtsp://"):
-        cam_type = "rtsp"
-    elif source.isdigit():
-        source = int(source)
-        cam_type = "local"
-
-    entry = _register_camera(name, source, cam_type)
-    return jsonify({
-        "id": entry["id"],
-        "name": entry["name"],
-        "source": str(entry["source"]),
-        "type": entry["type"],
-        "status": entry["status"],
-    }), 201
-
-
-@app.route("/api/cameras/<cam_id>", methods=["DELETE"])
-def remove_camera(cam_id):
-    """Remove a camera from the registry."""
-    if cam_id == "cam_local":
-        return jsonify({"error": "Cannot remove the default local camera"}), 400
+        return _json_error("Provide 'name' and 'source'")
+    source = parse_source(source)
+    cam_type = "local" if isinstance(source, int) else "rtsp" if source.startswith("rtsp://") else "ip"
     with _cam_lock:
-        cam = _find_cam(cam_id)
-        if not cam:
-            return jsonify({"error": "Camera not found"}), 404
-        cam["removed"] = True
-        try:
-            if cam.get("capture") and cam["capture"].isOpened():
-                cam["capture"].release()
-        except Exception:
-            pass
-        camera_registry[:] = [c for c in camera_registry if c["id"] != cam_id]
-    print(f"📷 Removed camera '{cam.get('name')}' (id={cam_id})", flush=True)
+        n = 2
+        while f"cam_{n}" in pipelines:
+            n += 1
+        cam_id = f"cam_{n}"
+    try:
+        cameras_collection.insert_one({"cam_id": cam_id, "name": name, "source": str(source), "type": cam_type})
+    except Exception as e:
+        print(f"⚠ Camera '{name}' will not survive a restart: {e}", flush=True)
+    p = add_pipeline(cam_id, name, source, cam_type)
+    return jsonify(p.info()), 201
+
+
+@app.delete("/api/cameras/<cam_id>")
+def remove_camera(cam_id):
+    if cam_id == DEFAULT_CAM:
+        return _json_error("Cannot remove the default camera")
+    with _cam_lock:
+        p = pipelines.pop(cam_id, None)
+    if p is None:
+        return _json_error("Camera not found", 404)
+    p.stop()
+    try:
+        cameras_collection.delete_one({"cam_id": cam_id})
+    except Exception:
+        pass
     return jsonify({"ok": True})
 
 
 @app.route("/api/cameras/<cam_id>/feed")
 def camera_feed(cam_id):
-    """MJPEG stream for a specific camera."""
-    # For the default local camera, use the existing generate_frames
-    if cam_id == "cam_local":
-        return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
-
-    cam = _find_cam(cam_id)
-    if not cam:
-        return jsonify({"error": "Camera not found"}), 404
-    return Response(_generate_cam_feed(cam), mimetype="multipart/x-mixed-replace; boundary=frame")
+    return _pipeline_video(cam_id)
 
 
-@app.route("/api/cameras/<cam_id>/test", methods=["POST"])
+@app.post("/api/cameras/<cam_id>/test")
 def test_camera(cam_id):
-    """Test if a camera connection is working."""
-    cam = _find_cam(cam_id)
-    if not cam:
-        return jsonify({"error": "Camera not found"}), 404
+    p = get_pipeline(cam_id)
+    if p is None:
+        return _json_error("Camera not found", 404)
+    fresh = bool(p.perf.capture_ts) and time.time() - p.perf.capture_ts[-1] < 2.0
+    return jsonify({"ok": fresh and not p.paused, "status": p.status, "error": p.error})
 
-    if cam.get("is_default"):
-        ok = camera and camera.isOpened() and not camera_paused
-        return jsonify({"ok": ok, "status": "online" if ok else "paused" if camera_paused else "offline"})
 
-    cap = cam.get("capture")
-    if cap is None or not cap.isOpened():
-        try:
-            cap = _open_capture(cam["source"])
-            cam["capture"] = cap
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)})
-    ok = cap.isOpened()
-    if ok:
-        ret, _ = cap.read()
-        ok = ret
-    cam["status"] = "online" if ok else "offline"
-    return jsonify({"ok": ok, "status": cam["status"]})
-
+# =====================================================================
 
 def _clean_exit(*_):
-    """Force clean exit to avoid Python 3.13 thread cleanup crash on Windows."""
-    print("\n🛑 Shutting down cleanly...", flush=True)
-    # Release cameras
-    try:
-        if camera and camera.isOpened():
-            camera.release()
-    except Exception:
-        pass
-    for c in camera_registry:
-        try:
-            cap = c.get("capture")
-            if cap and cap.isOpened():
-                cap.release()
-        except Exception:
-            pass
+    print("\n🛑 Shutting down...", flush=True)
+    for p in list(pipelines.values()):
+        p.stop()
     os._exit(0)
+
+
+def serve():
+    """Waitress in front by default; Flask's dev server only when asked for.
+
+    send_bytes=1 stops waitress buffering the live event stream. Measured on the
+    demo video, camera->client latency by send_bytes: 1 -> 29 ms, 4096 -> 1.4 s,
+    18000 (waitress default) -> 6.3 s. MJPEG throughput is unaffected (~11.9 fps
+    either way), so the small value costs nothing here.
+
+    Each camera stream and each SSE subscriber holds a thread, hence the
+    generous thread count.
+    """
+    host, port = "0.0.0.0", int(os.environ.get("PORT", "5000"))
+    if _flag("FLASK_DEV", "0"):
+        print(f"⚠ Flask development server on {port} (FLASK_DEV=1)", flush=True)
+        app.run(host=host, port=port, threaded=True)
+        return
+    from waitress import serve as waitress_serve
+    threads = int(os.environ.get("SERVER_THREADS", "24"))
+    print(f"✓ Serving on http://{host}:{port} (waitress, {threads} threads)", flush=True)
+    waitress_serve(app, host=host, port=port, threads=threads,
+                   send_bytes=int(os.environ.get("SERVER_SEND_BYTES", "1")),
+                   channel_timeout=86400, ident="SecureVision")
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _clean_exit)
     signal.signal(signal.SIGTERM, _clean_exit)
-    # debug help: list routes so you can confirm endpoints exist
-    print("Registered routes:")
-    for rule in app.url_map.iter_rules():
-        print(f"  {rule}")
-    app.run(host="0.0.0.0", port=5000)
+    serve()

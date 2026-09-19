@@ -51,6 +51,12 @@ export default function RegisterPage() {
   const [statusMsg, setStatusMsg] = useState(null);
   const [devices, setDevices] = useState([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState(null);
+  const [identities, setIdentities] = useState(null);
+
+  const loadIdentities = useCallback(() => {
+    fetch("/api/users").then((r) => (r.ok ? r.json() : null)).then(setIdentities).catch(() => {});
+  }, []);
+  useEffect(() => { loadIdentities(); }, [loadIdentities]);
 
   // ── Load face-api models on mount ───────────────────────────
   useEffect(() => {
@@ -83,7 +89,7 @@ export default function RegisterPage() {
         const front = videoInputs.find((d) => /front|user/i.test(d.label));
         if (front) setSelectedDeviceId(front.deviceId);
         else if (videoInputs.length === 1) setSelectedDeviceId(videoInputs[0].deviceId);
-      } catch (_) { }
+      } catch { /* best effort */ }
     }
     loadDevices();
   }, []);
@@ -102,17 +108,17 @@ export default function RegisterPage() {
     try {
       const s = videoRef.current?.srcObject;
       if (s) { s.getTracks().forEach((t) => t.stop()); videoRef.current.srcObject = null; }
-    } catch (_) { }
+    } catch { /* best effort */ }
     // try to resume backend camera
-    fetch("/camera/resume", { method: "POST" }).catch(() => { });
+    fetch("/api/camera/resume", { method: "POST" }).catch(() => { });
   }
 
   // ── Start camera ────────────────────────────────────────────
   async function startCamera() {
     // pause backend camera so browser can use it
     try {
-      await fetch("/camera/pause", { method: "POST" });
-    } catch (_) { }
+      await fetch("/api/camera/pause", { method: "POST" });
+    } catch { /* best effort */ }
 
     const constraints = { audio: false };
     if (selectedDeviceId) {
@@ -228,7 +234,7 @@ export default function RegisterPage() {
         prompt = brightness < QUALITY.minBrightness ? "Need more light" : "Too bright";
         return { ok: false, prompt, checks };
       }
-    } catch (_) {
+    } catch {
       checks.brightness = true; // skip if error
     }
 
@@ -241,23 +247,11 @@ export default function RegisterPage() {
         prompt = "Hold still";
         return { ok: false, prompt, checks };
       }
-    } catch (_) {
+    } catch {
       checks.sharpness = true;
     }
 
     return { ok: true, prompt: "Hold still…", checks };
-  }
-
-  // ── Capture a single frame ──────────────────────────────────
-  function captureFrame() {
-    const video = videoRef.current;
-    if (!video) return null;
-    const c = canvasRef.current;
-    c.width = video.videoWidth || 640;
-    c.height = video.videoHeight || 480;
-    const ctx = c.getContext("2d");
-    ctx.drawImage(video, 0, 0, c.width, c.height);
-    return c.toDataURL("image/jpeg", 0.92);
   }
 
   // ── Begin registration ──────────────────────────────────────
@@ -400,7 +394,7 @@ export default function RegisterPage() {
             setCaptured([...capturedDuringRun.current]);
             console.log(`Capture ${capturedDuringRun.current.length}: full frame (no face detected)`);
           }
-        } catch (e) {
+        } catch {
           // Fallback on error
           const frame = c.toDataURL("image/jpeg", 0.92);
           capturedDuringRun.current.push(frame);
@@ -431,8 +425,10 @@ export default function RegisterPage() {
       const j = await res.json().catch(() => null);
       if (!res.ok) throw j || { error: `HTTP ${res.status}` };
       setPhase(PHASE.DONE);
-      setStatusMsg({ ok: true, text: `✓ ${j.name} registered (${j.samples} samples${j.rejected ? `, ${j.rejected} rejected` : ""})` });
+      const what = j.created ? "registered" : `updated (${j.total_samples} samples in total)`;
+      setStatusMsg({ ok: true, text: `✓ ${j.name} ${what} — ${j.samples} new sample${j.samples === 1 ? "" : "s"}${j.rejected ? `, ${j.rejected} rejected` : ""}` });
       stopEverything();
+      loadIdentities();
     } catch (err) {
       setStatusMsg({ ok: false, text: err?.error || String(err) });
       setPhase(PHASE.REVIEW);
@@ -463,7 +459,7 @@ export default function RegisterPage() {
   //  RENDER
   // ═════════════════════════════════════════════
   const showCamera = [PHASE.POSITIONING, PHASE.SCANNING, PHASE.REVIEW].includes(phase);
-  const { cx, cy, rx, ry, w: ovalW, h: ovalH } = getOvalGeom();
+  const { rx, ry } = getOvalGeom();
 
   // SVG progress ring params (slightly larger than oval)
   const ringRx = rx + 8, ringRy = ry + 8;
@@ -486,6 +482,19 @@ export default function RegisterPage() {
       {/* ── Name input + Begin button (idle phase) ─────────── */}
       {phase === PHASE.IDLE && (
         <div className="w-full max-w-sm space-y-4">
+          {identities?.needs_reenrollment?.length > 0 && (
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-300">
+              <div className="font-semibold mb-1">Re-enrollment needed</div>
+              These people were enrolled with a different face model and cannot be recognised until they
+              register again: {identities.needs_reenrollment.map((u) => u.name).join(", ")}.
+            </div>
+          )}
+          {identities?.matchable?.length > 0 && (
+            <div className="text-xs text-gray-500">
+              Enrolled: {identities.matchable.map((u) => `${u.name} (${u.samples})`).join(", ")}.
+              Registering an existing name adds samples to that person.
+            </div>
+          )}
           <div>
             <label className="block text-sm text-gray-300 mb-1">Name</label>
             <input

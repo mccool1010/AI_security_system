@@ -1,0 +1,9 @@
+# Installed with: pip install --no-deps -r requirements-nodeps.txt
+#
+# facenet-pytorch 2.6.0 declares torch<2.3 and pillow<10.3 in its metadata,
+# which would force a CPU-only, pre-RTX-50 PyTorch. Its code runs fine on
+# torch 2.7 (verified by backend/tests and eval/bench.py), so its declared
+# dependencies are skipped and provided by requirements.txt instead.
+# pytorchvideo 0.1.5 has an unresolvable iopath pin for the same reason.
+facenet-pytorch==2.6.0
+pytorchvideo==0.1.5

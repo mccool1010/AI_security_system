@@ -23,7 +23,6 @@ dashboard/dist/
 # ── ML Models (large files, auto-downloaded) ─
 backend/*.pt
 backend/*.onnx
-backend/kinetics_400_labels.json
 backend/yolov8n-pose.pt
 
 # ── Screenshots & media ────────────────────
@@ -54,3 +53,10 @@ backend/calibration_data/
 
 # ── Docker ──────────────────────────────────
 docker-compose.override.yml
+
+# Local database backups (contain biometric data)
+backend/backups/
+
+# Secrets and recorded media (never commit)
+backend/.secrets/
+backend/static/clips/

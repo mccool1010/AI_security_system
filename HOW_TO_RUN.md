@@ -1,106 +1,136 @@
 # 🏃‍♂️ How to Run SecureVision Locally
 
-This guide will walk you through setting up and running the SecureVision AI surveillance pipeline on your local machine.
-
 ## 📦 Prerequisites
-Before you start, make sure you have the following installed on your machine:
-1. **Python 3.9 or higher**: For running the deep learning models and Flask backend.
-2. **Node.js (version 18+)**: For running the React/Vite dashboard.
-3. **Git**: To clone the repository.
-4. **A Webcam or CCTV stream**: The system automatically attempts to connect to your primary USB camera (Camera 0) by default.
+1. **Python 3.12** for the backend.
+2. **Node.js 18+** for the dashboard.
+3. **MongoDB**, either local or started by Docker (see below).
+4. **A webcam or IP/RTSP camera.** Camera 0 is used by default; set `CAMERA_SOURCE` to change it.
+5. **Optional: an NVIDIA GPU.** RTX 50-series cards need a recent driver. The installer detects the GPU and installs CUDA 12.8 PyTorch.
 
 ---
 
-## 🛠️ Step 1: Install Backend Dependencies
+## 🛠️ Step 1: Install
 
-The backend manages all AI inference (YOLOv8, MiDaS, SlowFast, DeepFace) and serves the WebSocket streams.
+### Windows
+Double-click **`install.bat`**. It will:
+- create `backend\venv`;
+- install PyTorch 2.7.1 (CUDA 12.8 if `nvidia-smi` works, otherwise the CPU build);
+- install the backend requirements and the dashboard packages.
 
-1. Open your terminal and navigate to the backend folder:
-   ```bash
-   cd backend
-   ```
-2. Create a virtual environment to keep dependencies isolated:
-   ```bash
-   python -m venv venv
-   ```
-3. Activate the virtual environment:
-   - **Windows**: `venv\Scripts\activate`
-   - **Mac/Linux**: `source venv/bin/activate`
-4. Install all required ML libraries and Flask dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-*(Note: PyTorch, Ultralytics YOLO, and DeepFace will automatically download their pre-trained weights the very first time you run the system).*
+Set `FORCE_CPU=1` before running it to force the CPU build.
 
----
-
-## 🎨 Step 2: Install Frontend Dependencies
-
-The frontend is a hardware-accelerated React/Vite Single Page Application (SPA).
-
-1. Open a **new, separate terminal window** and navigate to the dashboard folder:
-   ```bash
-   cd dashboard
-   ```
-2. Install the Node packages:
-   ```bash
-   npm install
-   ```
-
----
-
-## 🚀 Step 3: Start the System
-
-You have two options for starting the system.
-
-### Option A: The Easy Way (Windows Only)
-If you are on Windows, we have provided an all-in-one startup script. Simply double-click the `run.bat` file in the root directory.
-This script will automatically:
-- Activate your Python virtual environment.
-- Start the Flask backend server.
-- Start the Vite development server for the dashboard.
-- Bypass the portfolio landing page and boot directly into the live monitoring dashboard.
-
-### Option B: Manual Start (Mac/Linux/Windows)
-You need to keep **two** terminal windows running simultaneously.
-
-**Terminal 1 (The Backend):**
+### Manual (any OS)
 ```bash
 cd backend
-# Make sure your venv is activated!
-python app.py
-```
-*(Leave this window open and running. It will listen on port 5000).*
+python -m venv venv
+# Windows: venv\Scripts\activate    macOS/Linux: source venv/bin/activate
 
-**Terminal 2 (The Frontend):**
+# 1. PyTorch for your hardware
+pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128   # NVIDIA GPU
+# pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu  # CPU only
+
+# 2. Everything else
+pip install -r requirements.txt
+pip install --no-deps -r requirements-nodeps.txt
+```
+`requirements-nodeps.txt` contains facenet-pytorch and pytorchvideo. Their package metadata pins old PyTorch versions, so they're installed without their declared dependencies. The code works with PyTorch 2.7, and the test suite checks this.
+
 ```bash
-cd dashboard
-npm run dev
+cd ../dashboard
+npm install
 ```
-*(Leave this window open. It will provide a local URL, usually `http://localhost:5173`).*
 
-## 🐳 Option C: Using Docker (Recommended for Production)
-
-If you prefer containerization, this project includes a complete Docker setup that automatically spins up the Backend, Frontend, and a **MongoDB** database instance for persistent event storage.
-
-1. Make sure you have Docker and Docker Compose installed.
-2. From the root directory of the project, simply run:
-   ```bash
-   docker-compose up --build
-   ```
-3. Docker will automatically:
-   - Build and start the Python Backend container.
-   - Build and start the React Frontend container.
-   - Pull and start the official **MongoDB** container.
-   - Connect the backend seamlessly to the MongoDB database to log all security events.
-
-Once the containers are running, you can access the dashboard at `http://localhost:80`.
+Model weights download automatically on first start: YOLOv8-Pose, SlowFast, FaceNet, and MiDaS if enabled.
 
 ---
 
-## 🛑 What Needs to be Kept Running?
-To use the actual ML pipeline with real cameras, **both** the frontend and the backend processes must be actively running at the same time. 
-- If you close the Python backend, the video feeds and AI analytics will stop working.
-- If you close the Vite frontend, you will lose access to the UI dashboard.
+## 🚀 Step 2: Start
 
-If you ever need to stop the system, simply press `Ctrl + C` in both terminal windows.
+### Windows
+Double-click **`run.bat`**. It starts MongoDB in Docker if Docker is running, then the backend and the dashboard, and opens http://localhost:5173.
+
+### Manual
+```bash
+# terminal 1
+cd backend
+venv/Scripts/python app.py          # macOS/Linux: venv/bin/python app.py
+
+# terminal 2
+cd dashboard
+npm run dev                          # http://localhost:5173
+```
+
+On startup the backend prints the device in use (`cuda` or `cpu`), the face backend, whether any enrolled faces need re-enrolling — and, on the very first run, the generated dashboard password:
+
+```
+==============================================================
+  Dashboard password: 7Kd2p-QvXm9
+  Generated on first run and saved in backend/.secrets/password
+  Change it with the DASHBOARD_PASSWORD environment variable.
+==============================================================
+```
+
+The dashboard asks for it once and keeps a session cookie for 30 days. Everything
+except the health check requires it, including the camera streams. To run without
+a password on a machine nothing else can reach, set `AUTH_DISABLED=1`.
+
+The backend serves through **waitress**; use `FLASK_DEV=1` for Flask's reloading
+development server.
+
+### Demo mode (no camera)
+```bash
+DEMO_MODE=true DEMO_VIDEO=../test_video.mp4 venv/Scripts/python app.py
+```
+
+---
+
+## 📏 Step 3: Calibrate height (once per camera position)
+Go to **Settings → Height calibration**:
+1. Enter the height of a person standing fully in view and press **Record sample**.
+2. Repeat at three or more distances from the camera.
+3. Press **Calibrate**. Enter the camera's mount height first if you measured it.
+
+Until then, the dashboard shows "camera not calibrated" instead of a height.
+
+## 🧑 Step 4: Enroll faces
+Use **Enroll Face** in the dashboard. Registering the same name again adds samples to that person. The page lists anyone enrolled with an older face model who needs to register again.
+
+---
+
+## 🐳 Docker (MongoDB + dashboard)
+
+The backend runs natively so it can reach USB cameras and the GPU. Docker runs MongoDB and a production build of the dashboard:
+
+```bash
+docker compose up -d --build        # dashboard: http://localhost:3000
+cd backend && venv/Scripts/python app.py
+```
+
+`deploy.bat` / `deploy.sh` do both steps.
+
+## 🌐 Portfolio demo build
+```bash
+cd dashboard
+npm run build:demo                   # simulated data, landing page, "demo mode" banner
+```
+A normal `npm run build` never shows simulated data. If the backend is unreachable, the dashboard says so.
+
+---
+
+## ✅ Tests and benchmarks
+```bash
+cd backend
+venv/Scripts/python -m pip install pytest
+venv/Scripts/python -m pytest -q
+```
+See [backend/eval/README.md](backend/eval/README.md) to measure speed, latency and accuracy on your own hardware and footage.
+
+## 🎥 Overlays and event clips
+The live stream is drawn with boxes, skeletons, trails, identity, posture and a
+risk badge; set `OVERLAYS=0` for a clean feed. Every event also saves an MP4 of
+the seconds around it (`ENABLE_CLIPS=0` to disable) under
+`backend/static/clips/<camera>/`, pruned after 30 days or 2 GB. Recorded clips are
+never drawn on, so stored footage stays original.
+
+## 🛑 Stopping
+Press `Ctrl + C` in both terminals, or run `stop.bat`.

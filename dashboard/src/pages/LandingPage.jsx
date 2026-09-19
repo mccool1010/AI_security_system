@@ -18,39 +18,39 @@ export default function LandingPage() {
   const features = [
     {
       icon: "🎯",
-      title: "Real-Time Pose Detection",
-      desc: "YOLOv8-Pose with 17-keypoint skeleton tracking at 30+ FPS for instant person detection and body analysis",
+      title: "Pose & Posture",
+      desc: "YOLOv8-Pose keypoints tracked per person; posture (walking, running, falling, lying down, fighting) from body-size-normalised motion, so it holds at any resolution or frame rate",
       tech: "YOLOv8n-Pose",
     },
     {
       icon: "📏",
-      title: "Precision Height Measurement",
-      desc: "±3-5cm accuracy using 3-method consensus: keypoint segments, bounding box depth, and head-size estimation with Kalman filtering",
-      tech: "MiDaS + Kalman Filter",
+      title: "Height Measurement",
+      desc: "Ground-plane geometry: calibrate once with a person of known height, then every person is measured independently. The calibration reports its own leave-one-out error",
+      tech: "Camera geometry",
     },
     {
       icon: "🏃",
       title: "Activity Recognition",
-      desc: "200+ security-relevant action classes from SlowFast R50 trained on Kinetics-400 for real-time behavior analysis",
+      desc: "SlowFast R50 on person-centred clips, reduced to a few categories with a clear CCTV meaning: fighting, falls, running, climbing, spray painting",
       tech: "SlowFast R50",
     },
     {
       icon: "👤",
       title: "Face Recognition",
-      desc: "Multi-sample enrollment with ArcFace embeddings, quality scoring, and real-time matching against known persons database",
-      tech: "ArcFace / DeepFace",
+      desc: "Multi-sample enrollment with FaceNet embeddings. Every enrollment records the model that made it, so a model change can never silently mis-match people",
+      tech: "FaceNet + MTCNN",
     },
     {
       icon: "📷",
-      title: "Multi-Camera Support",
-      desc: "USB webcam, IP cameras, RTSP streams with per-camera intrinsic calibration and 20+ preset profiles",
-      tech: "OpenCV + Calibration",
+      title: "Multi-Camera",
+      desc: "USB, IP and RTSP cameras, one processing pipeline each whether or not anyone is watching, with 18 lens presets and checkerboard calibration",
+      tech: "OpenCV",
     },
     {
-      icon: "🔍",
-      title: "Monocular Depth Estimation",
-      desc: "Neural depth maps replacing naive heuristics — works for any camera angle including ceiling-mounted CCTV",
-      tech: "MiDaS v3.1 DPT",
+      icon: "⚡",
+      title: "Live Push & Measured Performance",
+      desc: "Detections and alerts are pushed to the dashboard over Server-Sent Events; throughput and latency are measured continuously and shown in the app",
+      tech: "SSE + /api/perf",
     },
   ];
 
@@ -65,11 +65,12 @@ export default function LandingPage() {
     { name: "YOLOv8", color: "#FF6F00" },
   ];
 
+  // Measured on an RTX 5050 laptop GPU (see README "Benchmarks"); the live dashboard shows current values.
   const metrics = [
-    { label: "ML Models", value: "5", sub: "Running concurrently" },
-    { label: "Height Accuracy", value: "±3cm", sub: "Calibrated camera" },
-    { label: "Camera Presets", value: "20+", sub: "Plug & play" },
-    { label: "Action Classes", value: "200+", sub: "Kinetics-400" },
+    { label: "Pipeline throughput", value: "48 fps", sub: "max per-frame path, RTX 5050 laptop" },
+    { label: "Camera → dashboard", value: "≈60 ms", sub: "median, live push" },
+    { label: "Neural networks", value: "5", sub: "pose · activity · 2× face · depth" },
+    { label: "Height error", value: "measured", sub: "per install, leave-one-out" },
   ];
 
   // Replace this with your actual YouTube video ID after recording
@@ -99,8 +100,8 @@ export default function LandingPage() {
 
           <p style={styles.heroSubtitle}>
             Full-stack intelligent surveillance system with real-time pose estimation,
-            precision height measurement, activity recognition, and face identification
-            — built from scratch with 5 deep learning models working in concert.
+            calibrated height measurement, activity recognition, and face identification
+            — five neural networks in one real-time pipeline per camera.
           </p>
 
           <div style={styles.heroButtons}>
@@ -172,7 +173,7 @@ export default function LandingPage() {
       <section style={styles.section}>
         <h2 style={styles.sectionTitle}>System Architecture</h2>
         <p style={styles.sectionSubtitle}>
-          5 ML models running concurrently in a real-time pipeline
+          One pipeline per camera; activity, faces and depth run on shared background workers
         </p>
 
         <div style={styles.pipelineContainer}>
@@ -180,7 +181,7 @@ export default function LandingPage() {
             { icon: "📹", name: "Camera Feed", detail: "USB / IP / RTSP", gradient: "linear-gradient(135deg, #667eea, #764ba2)" },
             { icon: "🦴", name: "YOLOv8-Pose", detail: "17 Keypoints", gradient: "linear-gradient(135deg, #f093fb, #f5576c)" },
             { icon: "🧠", name: "SlowFast R50", detail: "Activity Class", gradient: "linear-gradient(135deg, #4facfe, #00f2fe)" },
-            { icon: "📏", name: "Height Engine", detail: "Kalman + Depth", gradient: "linear-gradient(135deg, #43e97b, #38f9d7)" },
+            { icon: "📏", name: "Height", detail: "Ground geometry", gradient: "linear-gradient(135deg, #43e97b, #38f9d7)" },
             { icon: "🛡️", name: "Risk Engine", detail: "Alert + Log", gradient: "linear-gradient(135deg, #fa709a, #fee140)" },
           ].map((step, i, arr) => (
             <div key={i} style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -213,15 +214,15 @@ export default function LandingPage() {
       {/* ── Height Estimation Deep Dive ───────────────────────── */}
       <section style={{ ...styles.section, background: "rgba(99,102,241,0.03)", borderRadius: 20, margin: "0 auto", maxWidth: 1000, padding: "50px 30px" }}>
         <h2 style={styles.sectionTitle}>Height Estimation Pipeline</h2>
-        <p style={styles.sectionSubtitle}>The most technically complex subsystem — achieving ±3cm accuracy</p>
+        <p style={styles.sectionSubtitle}>No assumed heights — every person is measured from where they stand</p>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, marginTop: 30 }}>
           {[
-            { step: "1", title: "Undistort", desc: "Correct lens distortion on keypoints using camera intrinsics" },
-            { step: "2", title: "3-Method Measure", desc: "Keypoint segments, bbox+depth, head-size ruler — all independent" },
-            { step: "3", title: "Depth Estimation", desc: "MiDaS neural depth for metric distance, replacing naive foot-y heuristic" },
-            { step: "4", title: "Quality Scoring", desc: "Noise, blur, resolution, lighting, stability → quality gate" },
-            { step: "5", title: "Consensus Fusion", desc: "Weighted average with agreement bonus / disagreement penalty" },
-            { step: "6", title: "Kalman Filter", desc: "Per-person temporal smoothing — converges in ~10 frames" },
+            { step: "1", title: "Calibrate once", desc: "A person of known height stands at 3+ distances; camera height and tilt are fitted" },
+            { step: "2", title: "Error you can trust", desc: "Leave-one-out error over the reference samples is reported with the calibration" },
+            { step: "3", title: "Track", desc: "Each person is tracked; only upright, fully visible, large-enough views are measured" },
+            { step: "4", title: "Feet & head rows", desc: "Where the feet and head appear in the image, smoothed over a short window" },
+            { step: "5", title: "Ground-plane geometry", desc: "Feet row → distance along the ground; head row → height above it" },
+            { step: "6", title: "Robust per person", desc: "Median of all measurements, with the spread shown as ±" },
           ].map((s, i) => (
             <div key={i} style={{ padding: "18px 16px", borderRadius: 12, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)" }}>
               <div style={{ width: 28, height: 28, borderRadius: 8, background: "linear-gradient(135deg, #6366f1, #8b5cf6)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, marginBottom: 10 }}>{s.step}</div>

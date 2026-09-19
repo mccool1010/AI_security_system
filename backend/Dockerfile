@@ -23,15 +23,15 @@ WORKDIR /app
 # ── Stage 2: Install Python dependencies ─────────────────────
 FROM base AS deps
 
-COPY requirements.txt .
+COPY requirements.txt requirements-nodeps.txt ./
 
-# Install PyTorch CPU-only (saves ~1.5GB vs CUDA version)
-# For GPU support, replace with: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-RUN pip install --no-cache-dir \
-    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# PyTorch: CPU by default. For NVIDIA GPUs build with
+#   --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch==2.7.1 torchvision==0.22.1 --index-url ${TORCH_INDEX}
 
-# Install remaining requirements
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+ && pip install --no-cache-dir --no-deps -r requirements-nodeps.txt
 
 # ── Stage 3: Final image ─────────────────────────────────────
 FROM deps AS final

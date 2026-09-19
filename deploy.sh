@@ -32,31 +32,36 @@ echo "✓ Docker is installed and running"
 echo ""
 
 # Build and start
-echo "Building and starting all services..."
+echo "Building and starting MongoDB + dashboard..."
 echo "(This will take a few minutes on first run)"
 echo ""
 
 docker compose up -d --build
 
-echo ""
-echo "═══════════════════════════════════════════════"
-echo "✅ All services are running!"
-echo ""
-echo "  Dashboard:  http://localhost:3000"
-echo "  Backend:    http://localhost:5000"
-echo "  MongoDB:    localhost:27017"
-echo ""
-echo "  Useful commands:"
-echo "    docker compose logs -f backend    (watch ML logs)"
-echo "    docker compose down               (stop everything)"
-echo "    docker compose restart backend    (restart backend)"
-echo ""
-
-# USB camera hint for Linux
-if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    echo "  📷 USB Camera: Uncomment 'devices' in docker-compose.yml"
-    echo "     Then: docker compose up -d --build backend"
-    echo ""
+# The backend runs natively so it can reach cameras and the GPU.
+cd backend
+if [ ! -x venv/bin/python ]; then
+    echo "Installing the backend into backend/venv ..."
+    python3 -m venv venv
+    if command -v nvidia-smi &> /dev/null; then
+        TORCH_INDEX=https://download.pytorch.org/whl/cu128
+    else
+        TORCH_INDEX=https://download.pytorch.org/whl/cpu
+    fi
+    venv/bin/pip install --upgrade pip
+    venv/bin/pip install torch==2.7.1 torchvision==0.22.1 --index-url "$TORCH_INDEX"
+    venv/bin/pip install -r requirements.txt
+    venv/bin/pip install --no-deps -r requirements-nodeps.txt
 fi
 
+echo ""
 echo "═══════════════════════════════════════════════"
+echo "✅ MongoDB + dashboard are running"
+echo ""
+echo "  Dashboard:  http://localhost:3000"
+echo "  Backend:    http://localhost:5000  (starting below)"
+echo "  MongoDB:    localhost:27017"
+echo ""
+echo "  Stop Docker services with: docker compose down"
+echo "═══════════════════════════════════════════════"
+exec venv/bin/python app.py

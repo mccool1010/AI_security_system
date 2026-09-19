@@ -48,15 +48,10 @@ echo  [3/3] Starting Backend (for camera access)...
 
 cd backend
 
-:: Check if venv exists, if not create it
-if not exist ".venv\Scripts\activate.bat" (
-    echo  Creating Python virtual environment...
-    python -m venv .venv
+if not exist "venv\Scripts\python.exe" (
+    echo  Installing the backend - first run only...
+    call install_backend.bat || (pause & exit /b 1)
 )
-
-:: Activate venv and install requirements
-call .venv\Scripts\activate.bat
-pip install -r requirements.txt -q 2>nul
 
 echo.
 echo  ═══════════════════════════════════════════════════
@@ -73,4 +68,4 @@ echo  ════════════════════════�
 echo.
 
 :: Start Flask backend (this blocks — camera needs to run)
-python app.py
+venv\Scripts\python.exe app.py

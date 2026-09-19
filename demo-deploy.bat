@@ -47,12 +47,10 @@ echo.
 echo  [3/4] Checking Python environment...
 cd backend
 
-if not exist ".venv\Scripts\activate.bat" (
-    echo  Creating virtual environment...
-    python -m venv .venv
+if not exist "venv\Scripts\python.exe" (
+    echo  Installing the backend - first run only...
+    call install_backend.bat || (pause & exit /b 1)
 )
-call .venv\Scripts\activate.bat
-pip install -r requirements.txt -q 2>nul
 echo  OK Dependencies ready
 
 :: ── Start backend in DEMO MODE ──────────────────────────────
@@ -85,4 +83,4 @@ echo.
 
 :: Set DEMO_MODE and start Flask
 set DEMO_MODE=true
-python app.py
+venv\Scripts\python.exe app.py

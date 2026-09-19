@@ -38,16 +38,20 @@ export default function CamerasPage() {
                 setNewSource("");
                 setShowAdd(false);
                 fetchCameras();
+            } else {
+                const data = await res.json().catch(() => ({}));
+                window.alert(`Could not add camera: ${data.error || res.statusText}`);
             }
         } catch (err) {
-            console.error(err);
+            window.alert(`Could not add camera: ${err}`);
         }
         setLoading(false);
     };
 
     const removeCamera = async (id) => {
         try {
-            await fetch(`/api/cameras/${id}`, { method: "DELETE" });
+            const res = await fetch(`/api/cameras/${id}`, { method: "DELETE" });
+            if (!res.ok) window.alert((await res.json().catch(() => ({}))).error || res.statusText);
             fetchCameras();
         } catch (err) {
             console.error(err);
@@ -63,7 +67,7 @@ export default function CamerasPage() {
                 ...prev,
                 [id]: data.ok ? "✅ Connected" : `❌ ${data.status || "Failed"}`,
             }));
-        } catch (err) {
+        } catch {
             setTestResult((prev) => ({ ...prev, [id]: "❌ Error" }));
         }
         setTimeout(() => {
