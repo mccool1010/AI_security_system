@@ -74,7 +74,25 @@ graph TD
 
 ## 📊 Benchmarks
 
-Measured with `backend/eval/bench_models.py` and `backend/eval/bench_live.py` (see [backend/eval/README.md](backend/eval/README.md)).
+Every number below was measured on this machine with the scripts in
+[backend/eval/](backend/eval/README.md). Where something has not been measured, it says so.
+
+### The short answers
+
+| Question | Answer | How |
+|---|---|---|
+| **Inference FPS**, full pipeline | **11.8 fps sustained** with all five networks running, keeping 99–100% of a 12 fps source. Ceiling on the per-frame path: **48.4 fps**. CPU-only: 4.5–7.2 fps. | `eval/bench_live.py` |
+| **Hardware** | RTX 5050 Laptop GPU (8 GB) · i7-13620H (10C/16T) · 23.6 GB RAM · Windows 11, Balanced power · PyTorch 2.7.1+cu128 | — |
+| **End-to-end latency**, camera frame → dashboard | **29–30 ms median, 34–36 ms p95.** Frame → event stored: 52–121 ms. | SSE client, timestamps carried per frame |
+| **Total frames tested** | **6,075** frames through the live pipeline, plus 750 detection frames, 90 activity clips, 90 depth frames and 330 face crops. The source clip has 647 unique frames and loops. | `eval/bench_*.py` |
+| **Height error ± cm** vs a known reference | **Not measured** — it needs one person whose height you know. What *is* measured: the geometry is self-consistent to **±7.3 cm RMS** (below). | `eval/eval_height.py` |
+| **Identities enrolled** | **3** (Alice, harikrishna, h). Only **1** is matchable; the other two were enrolled with a different face model and must re-register. | `/api/users` |
+| **Face ID accuracy** | **Not measured** — it needs photos of enrolled people that were not used to enroll them, plus photos of strangers. | `eval/eval_faces.py` |
+| **Activity accuracy per class** | **Not measured** — 1 labelled clip exists (classified correctly, with and without SlowFast). Needs ~20 clips per class. | `eval/eval_activity.py` |
+
+The three unmeasured rows need footage only you can record; the evaluation kit
+turns that footage into the numbers. [backend/eval/README.md](backend/eval/README.md)
+says exactly what to record for each, and roughly an hour of recording covers all three.
 
 **Hardware:**
 - Intel Core i7-13620H (10 cores / 16 threads), 23.6 GB RAM
@@ -156,15 +174,45 @@ measurement depend on — are less confident. The default stays nano. Your camer
 may differ, so measure yours: `python eval/compare_pose_models.py --video yours.mp4`,
 then set `POSE_MODEL`.
 
-### Accuracy: not measured yet
+### Height: consistency measured, accuracy not
 
-No accuracy figure is claimed here, because none has been measured on labelled data. The kit measures each one on your own footage:
+Nobody in `test_video.mp4` has a known height, so absolute accuracy cannot be
+measured from it. Self-consistency can: calibrate the ground plane from half of
+one person's walk, then measure the same person on the half held out, as they
+move nearer and further.
+
+| | |
+|---|---|
+| Observations of one person | 50 (25 calibration / 25 held out) |
+| Their apparent size | 68 → 93 px tall (small, overhead view) |
+| Fitted camera | 6.62 m high, tilted 33.0° down |
+| Calibration leave-one-out error | **6.2 cm RMS** |
+| Held-out readings | **7.3 cm RMS**, 6.3 cm mean, 14.8 cm worst, −2.2 cm bias |
+| Spread of one person's live reading | **±4.7 cm** (interquartile/2 over 50 readings) |
+
+Read this as repeatability, not accuracy: the absolute scale comes from an
+assumed reference height, so it says the geometry holds together as someone
+crosses the frame, not that the metres are right. Two things would improve it —
+a subject filling more of the frame than 93 px, and calibration samples spread
+across the whole area rather than one short walk.
+
+For real accuracy, one person of known height and ten minutes gives
+`eval/eval_height.py` everything it needs.
+
+### Accuracy of face ID and activity: not measured
+
+Neither figure is claimed here, because neither has been measured on labelled
+data. The kit measures each on your own footage:
 
 | Metric | Command | You record |
 |---|---|---|
 | Height error (± cm) | `python eval/eval_height.py manifest.json` | a reference person + ≥5 people of known height |
 | Face ID accuracy, TAR / FAR | `python eval/eval_faces.py probes/` | new photos of enrolled people + strangers |
 | Activity precision / recall per class | `python eval/eval_activity.py clips/` | ≥20 labelled clips per class |
+
+On the one labelled clip available (a pedestrian walking), the classifier is
+correct with SlowFast and with `--no-slowfast`. One clip is a smoke test, not an
+accuracy figure.
 
 SlowFast was trained on Kinetics (YouTube, mostly eye-level). On overhead CCTV it can misfire: on the test clip it gave "drop kicking" a probability of 0.48 for someone walking. The alert thresholds are set with that in mind. Measure on your own footage, with and without SlowFast (`--no-slowfast`).
 

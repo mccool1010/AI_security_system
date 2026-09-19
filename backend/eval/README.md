@@ -14,6 +14,7 @@ All commands run from `backend/` with the virtual environment active.
 | Face ID accuracy | `eval/eval_faces.py` | photos of enrolled people and of strangers |
 | Activity accuracy per class | `eval/eval_activity.py` | labelled clips |
 | Is a bigger pose model worth it? | `eval/compare_pose_models.py` | any video |
+| Is the height geometry self-consistent? | `eval/height_consistency.py` | any video with one person |
 
 Every script prints a summary and writes full results with `--out results.json`.
 
@@ -90,6 +91,19 @@ is then better constrained.
 
 The live app shows the same calibration's leave-one-out error in
 *Settings → Height calibration*.
+
+## Height consistency (no known-height person needed)
+
+```bash
+python eval/height_consistency.py --video ../test_video.mp4
+```
+
+Calibrates from half of one person's observations and measures them on the other
+half as they move nearer and further. It reports repeatability, not accuracy —
+the scale comes from `--assumed-height`. Useful to sanity-check a new camera
+position before anyone stands in front of it with a tape measure. On the bundled
+clip: 6.2 cm leave-one-out, 7.3 cm RMS on held-out readings, on a subject only
+68-93 px tall.
 
 ## Face ID accuracy
 
